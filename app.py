@@ -17,6 +17,7 @@ from importer.ares_vr_client import AresVrClient
 from importer.ownership_resolve_online import resolve_tree_online
 from importer.graphviz_render import build_graphviz_from_nodelines_bfs
 
+import base64
 
 # ===== PATH pro 'dot' (Graphviz) – doplnění běžných cest =====
 for p in ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/opt/local/bin", "/snap/bin"):
@@ -818,10 +819,19 @@ Aktualizaci informací o SM lze provést nahlédnutím do ESM, případně také
 h_left, h_right = st.columns([8.5, 1.5], vertical_alignment="top")
 with h_left:
     if logo_bytes:
-        st.image(logo_bytes, width=480)  # velké ale rozumné
-    st.markdown("## MDG UBO Tool - AML kontrola vlastnické struktury na ARES")
-    st.markdown('<div class="small-muted">Online režim: společníci/akcionáři se načítají z ARES VR API (např. /ekonomicke-subjekty-vr/{ICO}).</div>', unsafe_allow_html=True)
+        _mime = logo_mime or "image/png"
+        _b64 = base64.b64encode(logo_bytes).decode("ascii")
+        _src = f"data:{_mime};base64,{_b64}"
+        st.markdown(
+            f'<img src="{_src}" style="display:block; margin:0 0 6px 0; width:480px; height:auto;" />',
+            unsafe_allow_html=True
+        )
 
+    st.markdown("## MDG UBO Tool - AML kontrola vlastnické struktury na ARES")
+    st.markdown(
+        '<div class="small-muted">Online režim: společníci/akcionáři se načítají z ARES VR API (např. /ekonomicke-subjekty-vr/{ICO}).</div>',
+        unsafe_allow_html=True
+    )
 
 
 with h_right:
