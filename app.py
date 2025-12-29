@@ -852,7 +852,7 @@ with h_left:
 
     st.markdown("## MDG UBO Tool - AML kontrola vlastnické struktury na ARES")
     st.markdown(
-        '<div class="small-muted">**Online režim:** společníci/akcionáři se načítají z ARES VR API.</div>',
+        '<div class="small-muted">Online režim: společníci/akcionáři se načítají z ARES VR API.</div>',
         unsafe_allow_html=True
     )
 
@@ -995,11 +995,11 @@ if st.session_state.get("auto_run_resolve"):
 # ===== Persistentní render =====
 lr = st.session_state.get("last_result")
 if lr:
-    st.subheader("Výsledek (text)")
+    st.subheader("VÝSLEDEK (text)")
     st.caption("Odsazení = úroveň. Každý blok: firma → její společníci/akcionáři.")
     st.code("\n".join(lr["text_lines"]), language="text")
 
-    st.subheader("Výsledek (graf)")
+    st.subheader("VÝSLEDEK (graf)")
     try:
         st.graphviz_chart(lr["graphviz"].source)
         if lr.get("graph_png") is None:
@@ -1066,7 +1066,7 @@ if lr:
                 st.rerun()
 
     # ===== OR links + PDF without UBO =====
-    st.subheader("ODKAZY NA OR")
+    st.subheader("ODKAZY NA OBCHODNÍ REJSTŘÍK")
     companies = lr["companies"]
     if not companies:
         st.info("Nebyla nalezena žádná právnická osoba s IČO.")
@@ -1113,7 +1113,7 @@ if lr:
             st.markdown("---")
 
     # Manuální osoby
-    st.markdown("**Manuální doplnění osob (např. u náhradního skutečného majitele):**")
+    st.markdown("**Manuální doplnění osob (např. náhradní SM):**")
     colM1, colM2, colM3, colM4, colM5, colM6, colM7 = st.columns([3, 2, 2, 2, 2, 2, 2])
     with colM1:
         manual_name = st.text_input("Jméno osoby", value="", key="manual_name")
@@ -1162,7 +1162,7 @@ if lr:
         threshold_pct = st.number_input(
             "Práh pro skutečného majitele (%)",
             min_value=0.0, max_value=100.0, value=float(st.session_state.get("threshold_pct_last", 25.0)), step=0.01,
-            help="Striktně > prahu (např. 25,01 %)."
+            help="Práh je nastaven striktně na "více než" 25 %, tzn. SM se stane osoba (či voting block) s 25,01 % a více."
         )
 
         st.write("**Osoby a jejich efektivní podíly (z OR) + možnost úprav:**")
@@ -1326,7 +1326,7 @@ if lr:
         st.session_state["note_text"] = st.text_area(
             "Poznámka",
             value=st.session_state.get("note_text", ""),
-            placeholder="Sem může uživatel napsat cokoliv…",
+            placeholder="Prostor pro poznámky v rámci kontroly ESM.",
             height=120,
         )
 
