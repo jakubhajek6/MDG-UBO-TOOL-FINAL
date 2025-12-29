@@ -817,17 +817,11 @@ Aktualizaci informací o SM lze provést nahlédnutím do ESM, případně také
 
 h_left, h_right = st.columns([8.5, 1.5], vertical_alignment="top")
 with h_left:
-    # logo + nadpis v jedné řádce, stejné levé zarovnání, malá mezera
-    c_logo, c_title = st.columns([1.2, 8.8], vertical_alignment="center")
-    with c_logo:
-        if logo_bytes:
-            st.image(logo_bytes, width=480)  # velké ale rozumné
-    with c_title:
-        st.markdown("## MDG UBO Tool - AML kontrola vlastnické struktury na ARES")
-        st.markdown(
-            '<div class="small-muted">Online režim: společníci/akcionáři se načítají z ARES VR API (např. /ekonomicke-subjekty-vr/{ICO}).</div>',
-            unsafe_allow_html=True
-        )
+    if logo_bytes:
+        st.image(logo_bytes, width=480)  # velké ale rozumné
+    st.markdown("## MDG UBO Tool - AML kontrola vlastnické struktury na ARES")
+    st.markdown('<div class="small-muted">Online režim: společníci/akcionáři se načítají z ARES VR API (např. /ekonomicke-subjekty-vr/{ICO}).</div>', unsafe_allow_html=True)
+
 
 
 with h_right:
