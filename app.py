@@ -26,7 +26,7 @@ for p in ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/opt/local/bin", "
         os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + p
 
 # ===== STREAMLIT PAGE CONFIG =====
-st.set_page_config(page_title="MDG UBO Tool", layout="wide")
+st.set_page_config(page_title="MDG UBO Tool", page_icon="favicon.png", layout="wide")
 
 # ===== THEME / CSS =====
 PRIMARY = "#2EA39C"
