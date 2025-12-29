@@ -18,7 +18,7 @@ from importer.ownership_resolve_online import resolve_tree_online
 from importer.graphviz_render import build_graphviz_from_nodelines_bfs
 
 import base64
-import zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo
 
 # ===== PATH pro 'dot' (Graphviz) – doplnění běžných cest =====
 for p in ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/opt/local/bin", "/snap/bin"):
