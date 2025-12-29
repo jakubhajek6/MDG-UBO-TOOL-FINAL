@@ -170,31 +170,73 @@ def extract_companies_from_lines(lines) -> list[tuple[str, str]]:
             found[ico] = name
     return sorted([(name, ico) for ico, name in found.items()], key=lambda x: x[0].lower())
 
-# ===== DB inicializace =====
-def ensure_ares_cache_db(db_path: str):
+# ===== DB inicializace + migrace schématu =====
+def ensure_ares_cache_db(db_path: str, schema_path: str | None = "db/schema.sql"):
+    """
+    Garantuje schéma SQLite a migruje staré sloupce cache na nové.
+    - Aplikuje schema.sql (CREATE TABLE IF NOT EXISTS ...)
+    - Migruje ares_vr_cache: payload -> payload_json; updated_at -> fetched_at
+    """
     if not db_path:
         return
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     try:
         c = conn.cursor()
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS ares_vr_cache (
-                ico TEXT PRIMARY KEY,
-                payload TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-        """)
+
+        # Aplikace schema.sql (idempotentně)
+        if schema_path and Path(schema_path).exists():
+            sql = Path(schema_path).read_text(encoding="utf-8")
+            c.executescript(sql)
+            conn.commit()
+        else:
+            # Fallback: jen cache tabulka
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS ares_vr_cache (
+                    ico TEXT PRIMARY KEY,
+                    fetched_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                )
+            """)
+            c.execute("CREATE INDEX IF NOT EXISTS idx_ares_vr_cache_fetched_at ON ares_vr_cache(fetched_at)")
+            conn.commit()
+
+        # Migrace starého schématu -> nové názvy
+        cols = {row[1] for row in c.execute("PRAGMA table_info(ares_vr_cache)").fetchall()}
+
+        if "payload" in cols and "payload_json" not in cols:
+            c.execute("ALTER TABLE ares_vr_cache ADD COLUMN payload_json TEXT")
+            c.execute("UPDATE ares_vr_cache SET payload_json = payload WHERE payload_json IS NULL")
+            conn.commit()
+            cols.add("payload_json")
+
+        if "updated_at" in cols and "fetched_at" not in cols:
+            c.execute("ALTER TABLE ares_vr_cache ADD COLUMN fetched_at TEXT")
+            c.execute("UPDATE ares_vr_cache SET fetched_at = updated_at WHERE fetched_at IS NULL")
+            conn.commit()
+            cols.add("fetched_at")
+
+        if "fetched_at" not in cols:
+            c.execute("ALTER TABLE ares_vr_cache ADD COLUMN fetched_at TEXT")
+            c.execute("UPDATE ares_vr_cache SET fetched_at = COALESCE(fetched_at, DATETIME('now'))")
+            conn.commit()
+
+        c.execute("CREATE INDEX IF NOT EXISTS idx_ares_vr_cache_fetched_at ON ares_vr_cache(fetched_at)")
         conn.commit()
+
     finally:
         conn.close()
 
+# Získání cesty k DB + inicializace
 try:
     from importer.pipeline import DB_PATH
     ares_db_path = str(DB_PATH)
 except Exception:
     ares_db_path = str(Path("data") / "ares_vr_cache.sqlite")
-ensure_ares_cache_db(ares_db_path)
+
+# Volitelný override přes env proměnnou
+ares_db_path = os.environ.get("ARES_CACHE_PATH", ares_db_path)
+ensure_ares_cache_db(ares_db_path, schema_path="db/schema.sql")
 
 # ======== ESM PDF Parsing (pomocné funkce) — MULTILINE + tituly bez tečky ========
 from PyPDF2 import PdfReader
@@ -632,14 +674,11 @@ def compute_effective_persons(lines) -> dict[str, dict]:
             else:
                 local_share = parse_pct_from_text(t)
                 if local_share is None:
-                    m = re.search(r"efektivně\s+(\d+(?:[.,;]\d+)?)\s*%", t, re.IGNORECASE)
+                    m = EFEKTIVNE_RE.search(t)
                     if m:
-                        try:
-                            eff_pct = float(m.group(1).replace(",", ".").replace(";", "."))
-                            if parent_mult > 0:
-                                local_share = (eff_pct / 100.0) / parent_mult
-                        except Exception:
-                            local_share = None
+                        eff_pct = _to_float(m.group(1))
+                        if eff_pct is not None and parent_mult > 0:
+                            local_share = (eff_pct / 100.0) / parent_mult
             pending_next_header_mult = parent_mult * local_share if local_share is not None else None
 
         else:
@@ -655,13 +694,11 @@ def compute_effective_persons(lines) -> dict[str, dict]:
                 if local_share is not None:
                     eff = parent_mult * local_share; src = "text(person)"
                 else:
-                    m = re.search(r"efektivně\s+(\d+(?:[.,;]\d+)?)\s*%", t, re.IGNORECASE)
+                    m = EFEKTIVNE_RE.search(t)
                     if m:
-                        try:
-                            eff_pct = float(m.group(1).replace(",", ".").replace(";", "."))
+                        eff_pct = _to_float(m.group(1))
+                        if eff_pct is not None:
                             eff = eff_pct / 100.0; src = "efektivně_text(person)"
-                        except Exception:
-                            eff = None
 
             if eff is not None:
                 entry["ownership"] += eff
@@ -845,7 +882,7 @@ title_html = f"""
   {'<img class="logo" src="' + data_uri + '"/>' if data_uri else ''}
   <h2>MDG UBO Tool - AML kontrola vlastnické struktury na ARES</h2>
 </div>
-<div class="header-caption"></div>
+<div class="header-caption">Online režim: společníci/akcionáři se načítají z ARES VR API (např. /ekonomicke-subjekty-vr/{{ICO}}).</div>
 """
 st.markdown(title_html, unsafe_allow_html=True)
 st.markdown("<br>", unsafe_allow_html=True)
@@ -875,7 +912,7 @@ if "esm_owners_pdf" not in st.session_state:
     st.session_state["esm_owners_pdf"] = None
 if "esm_debug_text" not in st.session_state:
     st.session_state["esm_debug_text"] = None
-# >>> NOVÉ: ruční vlastníci firem pro OR override <<<
+# >>> Ruční vlastníci firem pro OR override <<<
 if "manual_company_owners" not in st.session_state:
     # {target_company_ico: [{"ico": "XXXXXXXX", "share": 0..1}, ...]}
     st.session_state["manual_company_owners"] = {}
@@ -890,7 +927,7 @@ if run:
         client = AresVrClient(ares_db_path)
         cb("Načítám z ARES a rozkrývám…", 0.10)
 
-        # >>> Předání ručních override do resolve <<<
+        # Předání ručních override do resolve
         manual_overrides = {
             k: [(item["ico"], item["share"]) for item in v]
             for k, v in st.session_state["manual_company_owners"].items()
@@ -905,7 +942,7 @@ if run:
         cb("Hotovo.", 1.0)
 
         rendered = render_lines(lines)
-        # >>> SKRÝT HLAVIČKU „Manuálně doplněno:“ v grafu <<<
+        # Graf (renderer interně skrývá hlavičku „Manuálně doplněno:“)
         g = build_graphviz_from_nodelines_bfs(
             lines,
             root_ico=ico.strip(),
@@ -927,7 +964,6 @@ if run:
         st.session_state["final_persons"] = None
         st.session_state["esm_owners_pdf"] = None
         st.session_state["esm_debug_text"] = None
-        # POZN.: 'manual_company_owners' NEmažeme, aby šlo opakovaně doplňovat vlastníky mezi re‑resolve.
 
         st.session_state["last_result"] = {
             "lines": lines,
@@ -937,7 +973,6 @@ if run:
             "text_lines": rendered,
             "companies": companies,
             "ubo_pdf_lines": None,
-            # >>> přidáme seznam 'unresolved' pro UI doplnění <<<
             "unresolved": [w for w in warnings if isinstance(w, dict) and w.get("kind") == "unresolved"],
         }
         st.success("Struktura byla načtena. Níže se zobrazí výsledky.")
@@ -947,11 +982,11 @@ if run:
 # ===== Persistentní render =====
 lr = st.session_state.get("last_result")
 if lr:
-    st.subheader("VÝSLEDEK (textové vyhodnocení)")
+    st.subheader("Výsledek (Text)")
     st.caption("Odsazení = úroveň. Každý blok: firma → její společníci/akcionáři.")
     st.code("\n".join(lr["text_lines"]), language="text")
 
-    st.subheader("VÝSLEDEK (graf)")
+    st.subheader("Výsledek (Graf)")
     try:
         st.graphviz_chart(lr["graphviz"].source)
     except Exception:
@@ -963,7 +998,7 @@ if lr:
 
     unresolved_list = st.session_state.get("last_result", {}).get("unresolved") or []
     if not unresolved_list:
-        st.info("V aktuální struktuře jsou všechny vlastnické vztahy rozkryty.")
+        st.info("V aktuální struktuře nejsou firmy bez dohledaných vlastníků.")
     else:
         opts = [f"{u.get('name','?')} (IČO {str(u.get('ico') or '').zfill(8)})" for u in unresolved_list]
         picked = st.selectbox("Firma k doplnění", options=opts, index=0)
@@ -1026,7 +1061,6 @@ if lr:
                     )
                     lines2, warnings2 = _normalize_resolve_result(res2)
                     rendered2 = render_lines(lines2)
-                    # >>> SKRÝT HLAVIČKU „Manuálně doplněno:“ i po re-resolve <<<
                     g2 = build_graphviz_from_nodelines_bfs(
                         lines2,
                         root_ico=ico.strip(),
@@ -1052,12 +1086,12 @@ if lr:
                         "unresolved": [w for w in warnings2 if isinstance(w, dict) and w.get("kind") == "unresolved"],
                     }
                     st.success(f"Přidáno: {target_name} (IČO {target_ico}) — vlastníci doplněni, struktura znovu rozkryta.")
-                    # >>> vynutit okamžitý refresh UI po přidání manuálních vlastníků <<<
+                    # vynutit okamžitý refresh UI po přidání manuálních vlastníků
                     st.rerun()
                 except Exception as e:
                     st.error(f"Re‑resolve s manuálními vlastníky selhal: {e}")
 
-    st.subheader("ODKAZY NA OBCHODNÍ REJSTŘÍK")
+    st.subheader("ODKAZY NA OR")
     companies = lr["companies"]
     if not companies:
         st.info("Nebyla nalezena žádná právnická osoba s IČO.")
@@ -1084,14 +1118,14 @@ if lr:
 
     # ===== SKUTEČNÍ MAJITELÉ (dle OR) =====
     st.subheader("SKUTEČNÍ MAJITELÉ (dle OR)")
-    st.caption("Automatický přepočet textových podílů, násobení napříč patry a sčítání větvení. Úpravy ZK/HP v %, právo veta, „jmenuje/odvolává většinu orgánu“, náhradní SM (§ 5 ZESM) a voting block. Práh je striktně > nastavené hodnoty.")
+    st.caption("Automatický přepočet textových podílů, násobení napříč patry (včetně využití `effective_pct`), sčítání větvení. Úpravy ZK/HP v %, právo veta, „jmenuje/odvolává většinu orgánu“, náhradní SM (§ 5 ZESM) a voting block. Práh je striktně > nastavené hodnoty.")
 
     persons = compute_effective_persons(lr["lines"])
 
     # Diagnostika výpočtu (volitelně)
     show_debug = st.checkbox("Zobrazit diagnostiku výpočtu (cesty a násobení)", value=False)
     if show_debug:
-        st.info("Diagnostika: pro každou osobu jsou uvedeny jednotlivé cesty s multiplikátorem matky, lokálním podílem a efektivním podílem.")
+        st.info("Diagnostika: pro každou osobu jsou uvedeny jednotlivé cesty s multiplikátorem rodiče, lokálním podílem a efektivním příspěvkem.")
         for name, info in persons.items():
             st.markdown(f"**{name}** — efektivní kapitál: {fmt_pct(info['ownership'])}, hlasovací práva: {fmt_pct(info['voting'])}")
             dps = info.get("debug_paths", [])
@@ -1099,9 +1133,11 @@ if lr:
                 st.caption("Bez diagnostických záznamů.")
                 continue
             for i, dp in enumerate(dps, 1):
-                pm = fmt_pct(dp.get("parent_mult"))
-                ls = fmt_pct(dp.get("local_share")) if dp.get("local_share") is not None else "—"
-                ef = fmt_pct(dp.get("eff")) if dp.get("eff") is not None else "—"
+                def _fmt(x):
+                    return "—" if x is None else f"{x*100.0:.2f}%"
+                pm = _fmt(dp.get("parent_mult"))
+                ls = _fmt(dp.get("local_share"))
+                ef = _fmt(dp.get("eff"))
                 src = dp.get("source") or "unknown"
                 txt = dp.get("text") or ""
                 st.markdown(
@@ -1112,8 +1148,8 @@ if lr:
                 )
             st.markdown("---")
 
-    # Manuální doplnění osob (včetně „Náhradní SM (§ 5 ZESM)“)
-    st.markdown("**Manuální doplnění osob (např. náhradní SM):**")
+    # Manuální doplnění osob (např. u akciové společnosti)
+    st.markdown("**Manuální doplnění osob (např. u akciové společnosti):**")
     colM1, colM2, colM3, colM4, colM5, colM6, colM7 = st.columns([3, 2, 2, 2, 2, 2, 2])
     with colM1:
         manual_name = st.text_input("Jméno osoby (manuálně)", value="", key="manual_name")
@@ -1219,14 +1255,12 @@ if lr:
         st.divider()
         st.write("**Jednání ve shodě (voting block):**")
         all_names = list(set(list(persons.keys()) + list(st.session_state["manual_persons"].keys())))
-
         block_members = st.multiselect(
             "Vyber účastníky voting blocku",
             all_names,
             [],
-            placeholder="např. Jan Novák"
+            placeholder="např. Jan Novák",
         )
-
         block_name = st.text_input("Název voting blocku", value="Voting Block 1")
 
         submitted = st.form_submit_button("Vyhodnotit skutečné majitele")
@@ -1359,8 +1393,8 @@ if lr:
             )
 
     # ===== 3) ESM – Nahrání a porovnání =====
-    st.subheader("VÝPIS Z ESM — nahrání PDF a porovnání výsledků")
-    st.caption("⚠️Tuto část používej jen v případě, že máš aplikaci puštěnou **lokálně/on‑prem!**, a to z důvodu mlčenlivosti a neveřejného přístupu do ESM od 17.12.2025.")
+    st.subheader("Výpis z evidence skutečných majitelů (ESM) — nahrání a porovnání")
+    st.caption("⚠️ V mlčenlivém režimu spouštěj aplikaci **lokálně/on‑prem**. Nahrané PDF se zpracuje pouze **v paměti** (neukládá se na disk).")
 
     # === A) Nahrání oficiálního výpisu ESM (PDF) ===
     with st.expander("A) Nahrání oficiálního výpisu ESM (PDF)", expanded=False):
@@ -1394,7 +1428,7 @@ if lr:
             else:
                 st.success(f"Nalezeno záznamů SM v ESM PDF: {len(esm_owners)}")
 
-                # >>> ZOBRAZIT JEN JMÉNA (OČÍSLOVANĚ) <<<
+                # ZOBRAZIT JEN JMÉNA (OČÍSLOVANĚ)
                 st.markdown("**Jména z ESM PDF:**")
                 for i, o in enumerate(esm_owners, 1):
                     st.markdown(f"{i}. {o['name']}")
