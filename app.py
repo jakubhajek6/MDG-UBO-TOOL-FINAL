@@ -1162,7 +1162,8 @@ if lr:
         threshold_pct = st.number_input(
             "Práh pro skutečného majitele (%)",
             min_value=0.0, max_value=100.0, value=float(st.session_state.get("threshold_pct_last", 25.0)), step=0.01,
-            help="Práh je nastaven striktně na "více než" 25 %, tzn. SM se stane osoba (či voting block) s 25,01 % a více."
+            help="Práh je nastaven striktně na \"více než\" 25 %, tzn. SM se stane osoba (či voting block) s 25,01 % a více."
+
         )
 
         st.write("**Osoby a jejich efektivní podíly (z OR) + možnost úprav:**")
