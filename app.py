@@ -1,11 +1,9 @@
 import os
 import re
-import base64
 import sqlite3
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime
-import unicodedata
 import xml.etree.ElementTree as ET
 
 import streamlit as st
@@ -50,13 +48,7 @@ a, a:visited {{ color: {PRIMARY}; }}
 .stSlider div[data-baseweb="slider"] [class*="track"] {{ background-color: {PRIMARY} !important; }}
 .stSlider div[data-baseweb="slider"] [class*="thumb"] {{ background-color: {PRIMARY} !important; border: 2px solid {PRIMARY} !important; }}
 
-/* Header inline */
-.header-row {{
-  display: flex; align-items: center; gap: 8px; margin: 0; padding: 0;
-}}
-.header-row img.logo {{ height: 110px; width: auto; display: inline-block; }}
-.header-row h2 {{ margin: 0; padding: 0; line-height: 1.1; }}
-.header-caption {{ margin-top: 4px; }}
+/* Header */
 .small-muted {{ color: #666; font-size: 0.9rem; }}
 </style>
 """
@@ -80,11 +72,25 @@ def load_project_logo() -> tuple[bytes | None, str]:
 logo_bytes, logo_mime = load_project_logo()
 
 # ===== PDF FONT s diakritikou =====
-FONT_PATH = Path("assets") / "DejaVuSans.ttf"
+def find_font_file() -> Path | None:
+    # bere i font v rootu projektu (tvůj případ)
+    candidates = [
+        Path("DejaVuSans.ttf"),
+        Path("assets") / "DejaVuSans.ttf",
+        Path("fonts") / "DejaVuSans.ttf",
+        Path("static") / "DejaVuSans.ttf",
+        Path("DejaVuSans") / "DejaVuSans.ttf",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
+
 PDF_FONT_NAME = "DejaVuSans"
-if FONT_PATH.exists():
+font_path = find_font_file()
+if font_path:
     try:
-        pdfmetrics.registerFont(TTFont(PDF_FONT_NAME, str(FONT_PATH)))
+        pdfmetrics.registerFont(TTFont(PDF_FONT_NAME, str(font_path)))
     except Exception:
         PDF_FONT_NAME = "Helvetica"
 else:
@@ -168,11 +174,6 @@ def extract_companies_from_lines(lines) -> list[tuple[str, str]]:
 
 # ===== DB inicializace + migrace schématu =====
 def ensure_ares_cache_db(db_path: str, schema_path: str | None = "db/schema.sql"):
-    """
-    Garantuje schéma SQLite a migruje staré sloupce cache na nové.
-    - Aplikuje schema.sql (CREATE TABLE IF NOT EXISTS ...)
-    - Migruje ares_vr_cache: payload -> payload_json; updated_at -> fetched_at
-    """
     if not db_path:
         return
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -355,7 +356,7 @@ def compute_effective_persons(lines) -> dict[str, dict]:
             pending_next_header_mult = parent_mult * local_share if local_share is not None else None
 
         else:
-            entry = persons.setdefault(name, {"ownership": 0.0, "voting": 0.0, "paths": [], "debug_paths": []})
+            entry = persons.setdefault(name, {"ownership": 0.0, "voting": 0.0, "debug_paths": []})
 
             local_share = None
             eff = None
@@ -376,9 +377,6 @@ def compute_effective_persons(lines) -> dict[str, dict]:
             if eff is not None:
                 entry["ownership"] += eff
                 entry["voting"] += eff
-                entry["paths"].append((parent_depth, eff, t))
-            else:
-                entry["paths"].append((parent_depth, None, t))
 
             entry["debug_paths"].append({
                 "parent_depth": parent_depth,
@@ -510,7 +508,7 @@ def build_pdf(
             c.drawString(MARGIN, PAGE_H - MARGIN - 40, "⚠️ Nelze vložit obrázek grafu do PDF (chyba při renderu).")
     else:
         c.drawString(MARGIN, PAGE_H - MARGIN - 40,
-                     "⚠️ Graf není k dispozici pro PDF. Na Streamlit Cloud je potřeba nainstalovat Graphviz (dot).")
+                     "⚠️ Graf není k dispozici pro PDF. Na Streamlit Cloud je potřeba systémový Graphviz (dot).")
 
     # Odkazy OR
     if company_links:
@@ -559,25 +557,23 @@ def build_pdf(
     return buf.getvalue()
 
 # ===== Export/Import (XML) =====
-EXPORT_SCHEMA_VERSION = "1"
+EXPORT_SCHEMA_VERSION = "2"
 
 def _safe_text(x) -> str:
     return "" if x is None else str(x)
 
 def export_state_to_xml_bytes() -> bytes:
     root = ET.Element("mdg_ubo_export", attrib={"version": EXPORT_SCHEMA_VERSION})
-    now = ET.SubElement(root, "exported_at")
-    now.text = datetime.now().isoformat(timespec="seconds")
+    ET.SubElement(root, "exported_at").text = datetime.now().isoformat(timespec="seconds")
 
     def add_simple(tag: str, value):
         e = ET.SubElement(root, tag)
         e.text = _safe_text(value)
 
-    # vstupy
     add_simple("ico", st.session_state.get("ico_input", ""))
     add_simple("max_depth", st.session_state.get("max_depth", 25))
 
-    # manuální vlastníci firem
+    # manual_company_owners
     mco = ET.SubElement(root, "manual_company_owners")
     manual_company_owners = st.session_state.get("manual_company_owners", {}) or {}
     for target_ico, owners in manual_company_owners.items():
@@ -587,7 +583,7 @@ def export_state_to_xml_bytes() -> bytes:
             ET.SubElement(own, "ico").text = _safe_text(item.get("ico"))
             ET.SubElement(own, "share").text = _safe_text(item.get("share"))
 
-    # manuální osoby
+    # manual_persons
     mp = ET.SubElement(root, "manual_persons")
     manual_persons = st.session_state.get("manual_persons", {}) or {}
     for name, v in manual_persons.items():
@@ -608,25 +604,31 @@ def export_state_to_xml_bytes() -> bytes:
         it = ET.SubElement(ov_cap, "item", attrib={"name": _safe_text(name)})
         it.text = _safe_text(val)
 
-    # poslední nastavení vyhodnocení
+    # evaluation settings
     add_simple("threshold_pct_last", st.session_state.get("threshold_pct_last", 25.0))
+
     vb = ET.SubElement(root, "voting_block")
     ET.SubElement(vb, "block_name").text = _safe_text(st.session_state.get("block_name_last", "Voting Block 1"))
-    members = st.session_state.get("block_members_last", []) or []
     mem_el = ET.SubElement(vb, "members")
-    for n in members:
+    for n in st.session_state.get("block_members_last", []) or []:
         ET.SubElement(mem_el, "name").text = _safe_text(n)
 
-    # poznámky + kontrolní odpovědi
-    note = ET.SubElement(root, "postcheck")
-    ET.SubElement(note, "note_text").text = _safe_text(st.session_state.get("note_text", ""))
-    ET.SubElement(note, "check_esm").text = _safe_text(st.session_state.get("check_esm", ""))
-    ET.SubElement(note, "check_structure").text = _safe_text(st.session_state.get("check_structure", ""))
-    ET.SubElement(note, "check_described").text = _safe_text(st.session_state.get("check_described", ""))
-    ET.SubElement(note, "check_fixed").text = _safe_text(st.session_state.get("check_fixed", ""))
+    # postcheck
+    pc = ET.SubElement(root, "postcheck")
+    ET.SubElement(pc, "note_text").text = _safe_text(st.session_state.get("note_text", ""))
+    ET.SubElement(pc, "check_esm").text = _safe_text(st.session_state.get("check_esm", ""))
+    ET.SubElement(pc, "check_structure").text = _safe_text(st.session_state.get("check_structure", ""))
+    ET.SubElement(pc, "check_described").text = _safe_text(st.session_state.get("check_described", ""))
+    ET.SubElement(pc, "check_fixed").text = _safe_text(st.session_state.get("check_fixed", ""))
 
-    xml_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True)
-    return xml_bytes
+    # snapshot vyhodnocení pro okamžité PDF po importu
+    snap = ET.SubElement(root, "evaluation_snapshot")
+    ubo_lines = (st.session_state.get("last_result") or {}).get("ubo_pdf_lines") or []
+    lines_el = ET.SubElement(snap, "ubo_pdf_lines")
+    for ln in ubo_lines:
+        ET.SubElement(lines_el, "line").text = _safe_text(ln)
+
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 def _parse_bool(s: str) -> bool:
     return str(s).strip().lower() in ("1", "true", "yes", "ano")
@@ -634,7 +636,6 @@ def _parse_bool(s: str) -> bool:
 def import_state_from_xml_bytes(xml_bytes: bytes):
     root = ET.fromstring(xml_bytes)
 
-    # ico/max_depth
     ico_val = (root.findtext("ico") or "").strip()
     max_depth_val = root.findtext("max_depth") or "25"
     try:
@@ -740,55 +741,55 @@ def import_state_from_xml_bytes(xml_bytes: bytes):
         st.session_state["check_described"] = pc.findtext("check_described") or ""
         st.session_state["check_fixed"] = pc.findtext("check_fixed") or ""
 
-    # trigger auto resolve after import (if ICO exists)
+    # snapshot vyhodnocení
+    snap = root.find("evaluation_snapshot")
+    imported_ubo_lines = []
+    if snap is not None:
+        ubo_lines_el = snap.find("ubo_pdf_lines")
+        if ubo_lines_el is not None:
+            for ln in ubo_lines_el.findall("line"):
+                if ln.text is not None:
+                    imported_ubo_lines.append(ln.text)
+
+    # uložíme snapshot do session, po resolve ho vložíme do last_result
+    st.session_state["imported_ubo_pdf_lines"] = imported_ubo_lines
+
+    # trigger auto resolve
     st.session_state["auto_run_resolve"] = True
 
-
 # ===== Session state defaults =====
-if "last_result" not in st.session_state:
-    st.session_state["last_result"] = None
-if "ubo_overrides" not in st.session_state:
-    st.session_state["ubo_overrides"] = {}      # jméno -> 0..1 (hlasovací)
-if "ubo_cap_overrides" not in st.session_state:
-    st.session_state["ubo_cap_overrides"] = {}  # jméno -> 0..1 (kapitál)
-if "manual_persons" not in st.session_state:
-    st.session_state["manual_persons"] = {}     # {name: {"cap","vote","veto","org_majority","substitute_ubo"}}
-if "final_persons" not in st.session_state:
-    st.session_state["final_persons"] = None
-if "manual_company_owners" not in st.session_state:
-    st.session_state["manual_company_owners"] = {}
+def ss_default(key, val):
+    if key not in st.session_state:
+        st.session_state[key] = val
 
-# post-check fields
-if "note_text" not in st.session_state:
-    st.session_state["note_text"] = ""
-if "check_esm" not in st.session_state:
-    st.session_state["check_esm"] = ""          # agree/disagree
-if "check_structure" not in st.session_state:
-    st.session_state["check_structure"] = ""    # agree/disagree
-if "check_described" not in st.session_state:
-    st.session_state["check_described"] = ""    # yes/no
-if "check_fixed" not in st.session_state:
-    st.session_state["check_fixed"] = ""        # yes/no
+ss_default("last_result", None)
+ss_default("ubo_overrides", {})
+ss_default("ubo_cap_overrides", {})
+ss_default("manual_persons", {})
+ss_default("final_persons", None)
+ss_default("manual_company_owners", {})
 
-# last eval settings
-if "threshold_pct_last" not in st.session_state:
-    st.session_state["threshold_pct_last"] = 25.0
-if "block_members_last" not in st.session_state:
-    st.session_state["block_members_last"] = []
-if "block_name_last" not in st.session_state:
-    st.session_state["block_name_last"] = "Voting Block 1"
+ss_default("note_text", "")
+ss_default("check_esm", "")
+ss_default("check_structure", "")
+ss_default("check_described", "")
+ss_default("check_fixed", "")
 
-# input persistence
-if "ico_input" not in st.session_state:
-    st.session_state["ico_input"] = ""
-if "max_depth" not in st.session_state:
-    st.session_state["max_depth"] = 25
+ss_default("threshold_pct_last", 25.0)
+ss_default("block_members_last", [])
+ss_default("block_name_last", "Voting Block 1")
 
-# import trigger
-if "auto_run_resolve" not in st.session_state:
-    st.session_state["auto_run_resolve"] = False
+ss_default("ico_input", "")
+ss_default("max_depth", 25)
 
-# ===== Header with popovers =====
+ss_default("auto_run_resolve", False)
+
+# import control
+ss_default("import_uploader_key", 0)
+ss_default("import_pending_bytes", None)
+ss_default("imported_ubo_pdf_lines", [])
+
+# ===== Header with popovers – vpravo úplně u okraje a těsně vedle sebe =====
 HELP_TEXT = """Pro účely zákona o ESM se skutečným majitelem rozumí každá fyzická osoba, která v konečném důsledku vlastní nebo kontroluje právnickou osobu nebo právní uspořádání.
 
 Korporaci v konečném důsledku vlastní nebo kontroluje každá fyzická osoba, která přímo nebo nepřímo prostřednictvím jiné osoby nebo právního uspořádání:
@@ -805,30 +806,26 @@ Rozhodující vliv v:
 Jak na to?
 V § 9 odst. 2 písm. b) AML zákona se požaduje, aby povinná osoba v rámci kontroly klienta provedla zjištění totožnosti SM a přijala opatření k ověření jeho totožnosti z důvěryhodných zdrojů s tím, že v případě, že klient podléhá povinnosti zápisu do ESM nebo obdobného registru, povinná osoba ověřila SM vždy alespoň z této ESM nebo obdobného registru a z jednoho dalšího zdroje.
 
-Základním východiskem povinnosti zjišťování SM v AML zákoně je získání údajů z ESM, či jiné obdobné evidence. Vedle toho je požadováno, aby tento základní zdroj, jejž lze beze sporu považovat za zdroj vysoce důvěryhodný, byl doplněn dalším zdrojem. Tento druhý zdroj může být méně důvěryhodný, ale výsledné zjištění SM samozřejmě důvěryhodné být musí.
+Základním východiskem povinnosti zjišťování SM v AML zákoně je získání údajů z ESM, či jiné obdobné evidence. Vedle toho je požadováno, aby tento základní zdroj, jejž lze beze sporu považovat za zdroj vysoce důvěryhodný, byl doplněn dalším zdrojem.
 
 Povinná osoba by měla vycházet z kategorizace klientů podle rizikového profilu, kdy u klientů s nízkým či středním rizikem ML/TF se lze spokojit s doplňujícím zdrojem v podobě dokumentovaného čestného prohlášení SM nebo člena statutárního orgánu klienta - právnické osoby. Zatímco v případě vysoce rizikových klientů je nutné informace z ESM doplnit o vlastní šetření povinné osoby.
 
-Zjišťování SM se promítá také do zesílené kontroly klienta. Jsou-li naplněny zákonné podmínky pro povinné provedení zesílené kontroly, pak z § 9a odst. 3 písm. a) bodu 1 AML zákona vyplývá povinnost získat další informace nebo dokumenty o SM.
+Jsou-li naplněny zákonné podmínky pro povinné provedení zesílené kontroly, pak z § 9a odst. 3 písm. a) bodu 1 AML zákona vyplývá povinnost získat další informace nebo dokumenty o SM.
 
-Uvedený požadavek míří na provedení vlastního šetření při zjišťování SM ve vyšším standardu, zahrnujícím např. předložení zápisů z valných hromad.
-
-Aktualizaci informací o SM lze provést nahlédnutím do ESM, případně také dotazem na klienta (např. dotazem zobrazeným v internetovém bankovnictví klienta). Odůvodňuje-li to rizikovost klienta, je pak na místě v rozsahu potřebném k účinnému řízení ML/TF rizik provést šetření ze strany povinné osoby, které samozřejmě zahrnuje kontrolu v ESM či v obdobném registru.
-
-Případný dotaz na klienta musí být zaznamenán a formulován tak, aby klient odpověděl komisivně, čili aby výslovně odsouhlasil aktuálnost údajů v ESM. V případě, že klient takový dotaz ignoruje (i po opakovaných výzvách) a za využití různých způsobů zkontaktování klienta ze strany povinné osoby, tj. klient neposkytne potřebnou součinnost při kontrole klienta, je na místě uplatnit postup podle § 15 AML zákona a součinnost si vynutit prostřednictvím odmítnutí provedení jakéhokoli obchodu s klientem.
+Aktualizaci informací o SM lze provést nahlédnutím do ESM, případně také dotazem na klienta. Případný dotaz na klienta musí být zaznamenán a formulován tak, aby klient odpověděl komisivně, čili aby výslovně odsouhlasil aktuálnost údajů v ESM. Pokud klient neposkytne potřebnou součinnost, je na místě uplatnit postup podle § 15 AML zákona.
 """
 
-hcol1, hcol2 = st.columns([6, 2])
-with hcol1:
-    row = st.container()
-    with row:
-        if logo_bytes:
-            st.image(logo_bytes, width=220)
-        st.markdown("## MDG UBO Tool - AML kontrola vlastnické struktury na ARES")
-with hcol2:
-    # na úrovni titulku vpravo
-    p1, p2 = st.columns([1.2, 0.6], vertical_alignment="center")
-    with p1:
+h_left, h_right = st.columns([8.5, 1.5], vertical_alignment="top")
+with h_left:
+    if logo_bytes:
+        st.image(logo_bytes, width=480)  # velké ale rozumné
+    st.markdown("## MDG UBO Tool - AML kontrola vlastnické struktury na ARES")
+    st.markdown('<div class="small-muted">Online režim: společníci/akcionáři se načítají z ARES VR API (např. /ekonomicke-subjekty-vr/{ICO}).</div>', unsafe_allow_html=True)
+
+with h_right:
+    # na úplný pravý okraj, popovery vedle sebe
+    r1, r2 = st.columns([1.2, 0.7], vertical_alignment="top")
+    with r1:
         with st.popover("UŽITEČNÉ ODKAZY"):
             st.markdown(
                 "- Zákon - ESM: https://www.zakonyprolidi.cz/cs/2021-37\n"
@@ -836,14 +833,10 @@ with hcol2:
                 "- Metodické pokyny FAÚ: https://www.fau.gov.cz/cs/rozcestnik/legislativa-a-metodika/metodicke-pokyny-265\n"
                 "- Příručka evidování skutečných majitelů: https://www.fau.gov.cz/assets/cs/cmsmedia/legislativa-a-metodika/prirucka-evidovani-skutecnych-majitelu-d.pdf"
             )
-    with p2:
+    with r2:
         with st.popover("❓"):
             st.markdown(HELP_TEXT)
 
-st.markdown(
-    '<div class="header-caption">Online režim: společníci/akcionáři se načítají z ARES VR API (např. /ekonomicke-subjekty-vr/{ICO}).</div>',
-    unsafe_allow_html=True,
-)
 st.markdown("<br>", unsafe_allow_html=True)
 
 # ===== UI vstupy + EXPORT/IMPORT na úrovni tlačítka =====
@@ -853,11 +846,11 @@ st.session_state["ico_input"] = ico
 max_depth = st.slider("Max. hloubka rozkrytí", 1, 60, int(st.session_state.get("max_depth", 25)), 1)
 st.session_state["max_depth"] = int(max_depth)
 
-top_btn_col1, top_btn_col2, top_btn_col3, top_btn_col4 = st.columns([1.2, 1.0, 1.0, 3.0], vertical_alignment="center")
-with top_btn_col1:
+top1, top2, top3, top4 = st.columns([1.35, 1.05, 1.15, 3.0], vertical_alignment="center")
+with top1:
     run = st.button("🔎 Rozkrýt strukturu", type="primary")
 
-with top_btn_col2:
+with top2:
     xml_bytes = export_state_to_xml_bytes()
     st.download_button(
         label="⬇️ EXPORT (XML)",
@@ -867,20 +860,33 @@ with top_btn_col2:
         use_container_width=True,
     )
 
-with top_btn_col3:
-    uploaded_xml = st.file_uploader("⬆️ IMPORT (XML)", type=["xml"], label_visibility="collapsed")
-    if uploaded_xml is not None:
-        try:
-            import_state_from_xml_bytes(uploaded_xml.read())
-            st.success("Import hotový. Obnovuji stav a znovu načtu strukturu…")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Import selhal: {e}")
+with top3:
+    with st.popover("⬆️ IMPORT (XML)"):
+        up = st.file_uploader(
+            "Vyber XML soubor exportovaný z této aplikace",
+            type=["xml"],
+            key=f"import_uploader_{st.session_state['import_uploader_key']}",
+        )
+        if up is not None:
+            st.session_state["import_pending_bytes"] = up.read()
+            st.info("Soubor nahrán. Klikni na **Načíst import**.")
+        if st.button("Načíst import", type="primary"):
+            if not st.session_state.get("import_pending_bytes"):
+                st.warning("Nejprve nahraj XML soubor.")
+            else:
+                try:
+                    import_state_from_xml_bytes(st.session_state["import_pending_bytes"])
+                    st.session_state["import_pending_bytes"] = None
+                    st.session_state["import_uploader_key"] += 1  # reset uploaderu = konec loopu
+                    st.success("Import hotový. Obnovuji stav a znovu načtu strukturu…")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Import selhal: {e}")
 
-with top_btn_col4:
+with top4:
     st.write("")
 
-# ===== Resolve logic in function (for button + auto-run) =====
+# ===== Resolve logic =====
 def do_resolve():
     if not ico.strip():
         st.error("Zadej IČO.")
@@ -914,8 +920,7 @@ def do_resolve():
 
         graph_png = None
         try:
-            # Pozor: vyžaduje systémový graphviz (dot)
-            graph_png = g.pipe(format="png")
+            graph_png = g.pipe(format="png")  # vyžaduje systémový graphviz
         except Exception:
             graph_png = None
 
@@ -928,9 +933,14 @@ def do_resolve():
             "graph_png": graph_png,
             "text_lines": rendered,
             "companies": companies,
-            "ubo_pdf_lines": st.session_state.get("last_result", {}) and (st.session_state["last_result"] or {}).get("ubo_pdf_lines"),
+            "ubo_pdf_lines": (st.session_state.get("last_result") or {}).get("ubo_pdf_lines"),
             "unresolved": [w for w in warnings if isinstance(w, dict) and w.get("kind") == "unresolved"],
         }
+
+        # po importu: pokud máme snapshot ubo_pdf_lines, přeneseme ho do last_result
+        imported_lines = st.session_state.get("imported_ubo_pdf_lines") or []
+        if imported_lines:
+            st.session_state["last_result"]["ubo_pdf_lines"] = imported_lines
 
         st.success("Struktura byla načtena. Níže se zobrazí výsledky.")
     except Exception as e:
@@ -939,14 +949,7 @@ def do_resolve():
 
 # Button / auto-run
 if run:
-    # při ručním runu chceme resetovat vyhodnocení/poznámky jen pokud uživatel mění firmu atd.
-    # (ponecháme to jednoduché: při run resetujeme vyhodnocení)
-    st.session_state["final_persons"] = None
-    st.session_state["note_text"] = st.session_state.get("note_text", "")
-    st.session_state["check_esm"] = st.session_state.get("check_esm", "")
-    st.session_state["check_structure"] = st.session_state.get("check_structure", "")
-    st.session_state["check_described"] = st.session_state.get("check_described", "")
-    st.session_state["check_fixed"] = st.session_state.get("check_fixed", "")
+    # při ručním runu nemažeme importované volby, jen znovu načteme strukturu
     do_resolve()
 
 if st.session_state.get("auto_run_resolve"):
@@ -966,13 +969,13 @@ if lr:
         st.graphviz_chart(lr["graphviz"].source)
         if lr.get("graph_png") is None:
             st.warning(
-                "Graf se sice zobrazí v appce, ale pro PDF se na Streamlit Cloud negeneruje obrázek (chybí Graphviz 'dot'). "
-                "Řešení: přidej do repa `packages.txt` s jedním řádkem `graphviz` (apt balík)."
+                "Graf se zobrazuje v aplikaci, ale do PDF se nevloží obrázek (chybí Graphviz 'dot' pro render PNG). "
+                "Na Streamlit Cloud přidej do repa `packages.txt` s řádkem: `graphviz`."
             )
     except Exception:
         st.warning("Nelze zobrazit graf (Graphviz).")
 
-    # ===== Manuální doplnění vlastníků (firmy bez dohledaných vlastníků) =====
+    # ===== Manuální doplnění vlastníků =====
     st.subheader("Doplnění vlastníků u firem bez dohledaných společníků/akcionářů")
     st.caption("Vyber firmu bez vlastníků (OR) a doplň její vlastníky (IČO + podíl). Po přidání se struktura rekurzivně rozbalí až k FO.")
 
@@ -1023,8 +1026,6 @@ if lr:
                     st.warning(f"Součet podílů {total*100.0:.2f}% > 100% — pokračuji, ale zvaž úpravu.")
 
                 st.session_state["manual_company_owners"][target_ico] = parsed
-
-                # re-resolve
                 do_resolve()
                 st.success(f"Přidáno: {target_name} (IČO {target_ico}) — vlastníci doplněni, struktura znovu rozkryta.")
                 st.rerun()
@@ -1055,7 +1056,7 @@ if lr:
         type="primary",
     )
 
-    # ===== SKUTEČNÍ MAJITELÉ (dle OR) =====
+    # ===== SKUTEČNÍ MAJITELÉ =====
     st.subheader("SKUTEČNÍ MAJITELÉ (dle OR)")
     st.caption("Automatický přepočet textových podílů, násobení napříč patry. Úpravy ZK/HP v %, právo veta, „jmenuje/odvolává většinu orgánu“, náhradní SM (§ 5 ZESM) a voting block. Práh je striktně > nastavené hodnoty.")
 
@@ -1063,30 +1064,20 @@ if lr:
 
     show_debug = st.checkbox("Zobrazit diagnostiku výpočtu (cesty a násobení)", value=False)
     if show_debug:
-        st.info("Diagnostika: pro každou osobu jsou uvedeny jednotlivé cesty s multiplikátorem rodiče, lokálním podílem a efektivním příspěvkem.")
+        st.info("Diagnostika: pro každou osobu jsou uvedeny cesty s multiplikátorem rodiče, lokálním podílem a efektivním příspěvkem.")
         for name, info in persons.items():
             st.markdown(f"**{name}** — efektivní kapitál: {fmt_pct(info['ownership'])}, hlasovací práva: {fmt_pct(info['voting'])}")
-            dps = info.get("debug_paths", [])
-            if not dps:
-                st.caption("Bez diagnostických záznamů.")
-                continue
-            for i, dp in enumerate(dps, 1):
+            for i, dp in enumerate(info.get("debug_paths", []), 1):
                 def _fmt(x):
                     return "—" if x is None else f"{x*100.0:.2f}%"
-                pm = _fmt(dp.get("parent_mult"))
-                ls = _fmt(dp.get("local_share"))
-                ef = _fmt(dp.get("eff"))
-                src = dp.get("source") or "unknown"
-                txt = dp.get("text") or ""
                 st.markdown(
-                    f"- cesta {i}: úroveň {dp.get('parent_depth', 0)}, "
-                    f"multiplikátor rodiče: **{pm}**, lokální podíl: **{ls}**, "
-                    f"efektivní příspěvek: **{ef}**; zdroj: `{src}`\n"
-                    f"  \n  ↳ řádek: `{txt}`"
+                    f"- cesta {i}: multiplikátor rodiče **{_fmt(dp.get('parent_mult'))}**, "
+                    f"lokální podíl **{_fmt(dp.get('local_share'))}**, efektivní **{_fmt(dp.get('eff'))}**; zdroj `{dp.get('source')}`\n"
+                    f"  \n  ↳ `{dp.get('text')}`"
                 )
             st.markdown("---")
 
-    # Manuální doplnění osob
+    # Manuální osoby
     st.markdown("**Manuální doplnění osob (např. u akciové společnosti):**")
     colM1, colM2, colM3, colM4, colM5, colM6, colM7 = st.columns([3, 2, 2, 2, 2, 2, 2])
     with colM1:
@@ -1112,12 +1103,7 @@ if lr:
             "org_majority": manual_org_majority,
             "substitute_ubo": manual_substitute_ubo,
         }
-        st.success(
-            f"Přidáno: {manual_name.strip()} (kapitál {manual_cap:.2f} %, "
-            f"hlasovací {manual_vote:.2f} %, veto: {'ano' if manual_veto else 'ne'}, "
-            f"jmenuje/odvolává většinu orgánu: {'ano' if manual_org_majority else 'ne'}, "
-            f"náhradní SM (§ 5): {'ano' if manual_substitute_ubo else 'ne'})"
-        )
+        st.success(f"Přidáno: {manual_name.strip()}")
 
     if st.session_state["manual_persons"]:
         st.markdown("**Manuálně přidané osoby:**")
@@ -1125,16 +1111,13 @@ if lr:
             colR1, colR2 = st.columns([6, 1])
             with colR1:
                 st.markdown(
-                    f"- **{mn}** — kapitál: {fmt_pct(mi['cap'])}, "
-                    f"hlasovací práva: {fmt_pct(mi['vote'])}, "
-                    f"veto: {'ano' if mi['veto'] else 'ne'}, "
-                    f"jmenuje/odvolává většinu orgánu: {'ano' if mi['org_majority'] else 'ne'}, "
-                    f"náhradní SM (§ 5): {'ano' if mi.get('substitute_ubo') else 'ne'}"
+                    f"- **{mn}** — kapitál: {fmt_pct(mi['cap'])}, hlasovací: {fmt_pct(mi['vote'])}, "
+                    f"veto: {'ano' if mi['veto'] else 'ne'}, org.: {'ano' if mi['org_majority'] else 'ne'}, "
+                    f"náhradní SM: {'ano' if mi.get('substitute_ubo') else 'ne'}"
                 )
             with colR2:
                 if st.button(f"🗑️ Odebrat ({mn})", key=f"del_{mn}"):
                     st.session_state["manual_persons"].pop(mn, None)
-                    st.info(f"Odebráno: {mn}")
                     st.rerun()
 
     overrides_vote = st.session_state["ubo_overrides"]
@@ -1158,8 +1141,8 @@ if lr:
             colA, colB, colC, colD, colE = st.columns([2.8, 2.0, 2.0, 2.0, 2.2])
             with colA:
                 st.markdown(f"- **{name}**")
-                st.markdown(f"  • Podíl na kapitálu (efektivně): **{fmt_pct(info['ownership'])}**")
-                st.markdown(f"  • Hlasovací práva (výchozí): **{fmt_pct(info['voting'])}**")
+                st.markdown(f"  • Kapitál: **{fmt_pct(info['ownership'])}**")
+                st.markdown(f"  • Hlasovací: **{fmt_pct(info['voting'])}**")
             with colB:
                 cap_default = overrides_cap.get(name, info["ownership"]) * 100.0
                 edited_cap_pct[name] = st.number_input(
@@ -1179,16 +1162,13 @@ if lr:
                     key=f"vote_{idx}_{name}",
                 )
             with colD:
-                veto_flags[name] = st.checkbox(
-                    f"Právo veta ({name})", value=False, key=f"veto_{idx}_{name}",
-                )
-                org_majority_flags[name] = st.checkbox(
-                    f"Jmenuje/odvolává většinu orgánu ({name})", value=False, key=f"orgmaj_{idx}_{name}",
-                )
+                veto_flags[name] = st.checkbox(f"Právo veta ({name})", value=False, key=f"veto_{idx}_{name}")
+                org_majority_flags[name] = st.checkbox(f"Jmenuje/odvolává většinu orgánu ({name})", value=False, key=f"orgmaj_{idx}_{name}")
             with colE:
                 substitute_flags[name] = st.checkbox(
-                    f"Náhradní SM (§ 5) ({name})", value=False, key=f"subs_{idx}_{name}",
-                    help="Použij při naplnění § 5 ZESM (nelze určit SM / rozhodující vliv PO bez SM)."
+                    f"Náhradní SM (§ 5) ({name})",
+                    value=False,
+                    key=f"subs_{idx}_{name}",
                 )
 
         st.divider()
@@ -1198,25 +1178,21 @@ if lr:
             "Vyber účastníky voting blocku",
             all_names,
             st.session_state.get("block_members_last", []),
-            placeholder="např. Jan Novák",
         )
         block_name = st.text_input("Název voting blocku", value=st.session_state.get("block_name_last", "Voting Block 1"))
 
         submitted = st.form_submit_button("Vyhodnotit skutečné majitele")
 
     if submitted:
-        # uložit last settings
         st.session_state["threshold_pct_last"] = float(threshold_pct)
         st.session_state["block_members_last"] = list(block_members)
         st.session_state["block_name_last"] = str(block_name)
 
-        # Ulož overrides
         for n, v in edited_voting_pct.items():
             overrides_vote[n] = v / 100.0
         for n, v in edited_cap_pct.items():
             overrides_cap[n] = v / 100.0
 
-        # Slož finální osoby (OR + manuální)
         final_persons: dict[str, dict] = {}
         for n, info in persons.items():
             final_persons[n] = {
@@ -1234,10 +1210,8 @@ if lr:
                 "org_majority": mi["org_majority"],
                 "substitute_ubo": mi.get("substitute_ubo", False),
             }
-
         st.session_state["final_persons"] = final_persons
 
-        # Součty
         total_cap = sum(max(0.0, min(1.0, v["cap"])) for v in final_persons.values())
         total_vote = sum(max(0.0, min(1.0, v["vote"])) for v in final_persons.values())
         TOL = 0.001
@@ -1256,10 +1230,8 @@ if lr:
         else:
             st.warning(f"Součet hlasovacích práv = {total_vote*100.0:.2f} % (chybí {max(0.0, miss_vote):.2f} % / přebytek {max(0.0, -miss_vote):.2f} %)")
 
-        # Voting block
         block_total = sum(final_persons.get(n, {"vote": 0.0})["vote"] for n in block_members) if block_members else 0.0
 
-        # Pravidla SM
         thr = (threshold_pct / 100.0)
         ubo: dict[str, dict] = {}
         reasons: dict[str, list[str]] = {}
@@ -1283,31 +1255,18 @@ if lr:
             if substitute:
                 is_ubo = True; add_reason(n, "náhradní skutečný majitel (§ 5 ZESM)")
             if is_ubo:
-                ubo[n] = {"cap": cap, "vote": vote, "veto": veto, "org_majority": orgmaj, "substitute_ubo": substitute}
+                ubo[n] = vals
 
         if block_members and block_total > thr:
             for n in block_members:
                 if n in final_persons:
-                    cap = final_persons[n]["cap"]; vote = final_persons[n]["vote"]
-                    veto = final_persons[n]["veto"]; orgmaj = final_persons[n]["org_majority"]
-                    substitute = final_persons[n].get("substitute_ubo", False)
-                    ubo[n] = {"cap": cap, "vote": vote, "veto": veto, "org_majority": orgmaj, "substitute_ubo": substitute}
-                    add_reason(n, f"účast v voting blocku „{block_name}“ s {fmt_pct(block_total)} > {threshold_pct:.2f}%")
+                    ubo[n] = final_persons[n]
+                    add_reason(n, f"účast ve voting blocku „{block_name}“ s {fmt_pct(block_total)} > {threshold_pct:.2f}%")
 
         st.success("Vyhodnocení dokončeno.")
         ubo_report_lines = []
-        if cap_ok:
-            ubo_report_lines.append(f"Součet podílů na ZK: {total_cap*100.0:.2f}% (OK)")
-        else:
-            ubo_report_lines.append(
-                f"Součet podílů na ZK: {total_cap*100.0:.2f}% (⚠︎ chybí {max(0.0, miss_cap):.2f}% / přebytek {max(0.0, -miss_cap):.2f}%)"
-            )
-        if vote_ok:
-            ubo_report_lines.append(f"Součet hlasovacích práv: {total_vote*100.0:.2f}% (OK)")
-        else:
-            ubo_report_lines.append(
-                f"Součet hlasovacích práv: {total_vote*100.0:.2f}% (⚠︎ chybí {max(0.0, miss_vote):.2f}% / přebytek {max(0.0, -miss_vote):.2f}%)"
-            )
+        ubo_report_lines.append(f"Součet podílů na ZK: {total_cap*100.0:.2f}% ({'OK' if cap_ok else '⚠︎'})")
+        ubo_report_lines.append(f"Součet hlasovacích práv: {total_vote*100.0:.2f}% ({'OK' if vote_ok else '⚠︎'})")
 
         if not ubo:
             st.info("Nebyly zjištěny fyzické osoby splňující definici skutečného majitele dle zadaných pravidel.")
@@ -1319,15 +1278,14 @@ if lr:
                 st.markdown(line_txt)
                 ubo_report_lines.append(line_txt)
 
-        # ulož do session (PDF i UI)
         st.session_state["last_result"]["ubo_pdf_lines"] = ubo_report_lines
-        # po vyhodnocení necháme post-check volby tak jak jsou (uživatel vyplní níže)
+        st.session_state["imported_ubo_pdf_lines"] = ubo_report_lines  # aby export/import byl konzistentní
 
-    # ===== POST-CHECK + PDF (po vyhodnocení) =====
+    # ===== POST-CHECK + PDF (po vyhodnocení nebo po importu snapshotu) =====
     if lr.get("ubo_pdf_lines"):
         st.divider()
-
         st.markdown("### Poznámka a kontrolní otázky")
+
         st.session_state["note_text"] = st.text_area(
             "Poznámka",
             value=st.session_state.get("note_text", ""),
@@ -1352,7 +1310,6 @@ if lr:
             )
 
         any_negative = (st.session_state.get("check_esm") == "❌ nesouhlasí") or (st.session_state.get("check_structure") == "❌ nesouhlasí")
-
         if any_negative:
             d1, d2 = st.columns([1, 1])
             with d1:
@@ -1370,11 +1327,9 @@ if lr:
                     horizontal=True,
                 )
         else:
-            # když není negativní, schovej a vyčisti navazující odpovědi
             st.session_state["check_described"] = ""
             st.session_state["check_fixed"] = ""
 
-        # PDF (včetně vyhodnocení + poznámky + odpovědí)
         ubo_lines_for_pdf = list(lr["ubo_pdf_lines"])
         ubo_lines_for_pdf.append("")
         ubo_lines_for_pdf.append("Poznámka:")
