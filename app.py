@@ -18,6 +18,7 @@ from importer.ownership_resolve_online import resolve_tree_online
 from importer.graphviz_render import build_graphviz_from_nodelines_bfs
 
 import base64
+import zoneinfo import ZoneInfo
 
 # ===== PATH pro 'dot' (Graphviz) – doplnění běžných cest =====
 for p in ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/opt/local/bin", "/snap/bin"):
@@ -461,7 +462,9 @@ def build_pdf(
     _draw_wrapped_string(c, PDF_FONT_NAME, title_font, text_x, y_top - title_font, title, available_w)
 
     c.setFont(PDF_FONT_NAME, 10)
-    c.drawString(MARGIN, 18, f"Časové razítko: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    tz = ZoneInfo("Europe/Prague")
+    c.drawString(MARGIN, 18, f"Časové razítko: {datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S')}")
+
 
     start_y = logo_bottom_y - 12
     c.setFont(PDF_FONT_NAME, 12)
@@ -536,23 +539,43 @@ def build_pdf(
         c.setFont(PDF_FONT_NAME, 12)
         c.drawString(MARGIN, PAGE_H - MARGIN - 20, "Skuteční majitelé (vyhodnocení)")
         c.setFont(PDF_FONT_NAME, 10)
+
+        max_w = PAGE_W - 2 * MARGIN
         y = PAGE_H - MARGIN - 40
-        for line in ubo_lines:
-            if len(line) <= 120:
-                c.drawString(MARGIN, y, line); y -= 14
-            else:
-                s = line
-                while len(s) > 0:
-                    cut = s.rfind(" ", 0, 120)
-                    if cut == -1: cut = min(120, len(s))
-                    c.drawString(MARGIN, y, s[:cut]); y -= 14
-                    s = s[cut:].lstrip()
+        leading = 14
+
+        def draw_wrapped_line(text: str, x: float, y: float) -> float:
+            """Nakreslí text zalomený podle max_w, vrátí nové y."""
+            words = (text or "").split()
+            if not words:
+                c.drawString(x, y, "")
+                return y - leading
+
+            line = words[0]
+            for w in words[1:]:
+                candidate = line + " " + w
+                if _pdfmetrics.stringWidth(candidate, PDF_FONT_NAME, 10) <= max_w:
+                    line = candidate
+                else:
+                    c.drawString(x, y, line)
+                    y -= leading
                     if y < MARGIN + 40:
-                        c.showPage(); c.setFont(PDF_FONT_NAME, 10)
+                        c.showPage()
+                        c.setFont(PDF_FONT_NAME, 10)
                         y = PAGE_H - MARGIN - 40
+                    line = w
+
+            c.drawString(x, y, line)
+            return y - leading
+
+        for line in ubo_lines:
+            # když je to fakt dlouhé, zalomí se podle šířky stránky
+            y = draw_wrapped_line(line, MARGIN, y)
             if y < MARGIN + 40:
-                c.showPage(); c.setFont(PDF_FONT_NAME, 10)
+                c.showPage()
+                c.setFont(PDF_FONT_NAME, 10)
                 y = PAGE_H - MARGIN - 40
+
 
     c.save()
     return buf.getvalue()
