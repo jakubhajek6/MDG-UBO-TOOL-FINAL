@@ -852,7 +852,7 @@ with h_left:
 
     st.markdown("## MDG UBO Tool - AML kontrola vlastnické struktury na ARES")
     st.markdown(
-        '<div class="small-muted">Online režim: společníci/akcionáři se načítají z ARES VR API (např. /ekonomicke-subjekty-vr/{ICO}).</div>',
+        '<div class="small-muted">**Online režim:** společníci/akcionáři se načítají z ARES VR API.</div>',
         unsafe_allow_html=True
     )
 
@@ -995,11 +995,11 @@ if st.session_state.get("auto_run_resolve"):
 # ===== Persistentní render =====
 lr = st.session_state.get("last_result")
 if lr:
-    st.subheader("Výsledek (Text)")
+    st.subheader("Výsledek (text)")
     st.caption("Odsazení = úroveň. Každý blok: firma → její společníci/akcionáři.")
     st.code("\n".join(lr["text_lines"]), language="text")
 
-    st.subheader("Výsledek (Graf)")
+    st.subheader("Výsledek (graf)")
     try:
         st.graphviz_chart(lr["graphviz"].source)
         if lr.get("graph_png") is None:
@@ -1012,11 +1012,11 @@ if lr:
 
     # ===== Manuální doplnění vlastníků =====
     st.subheader("Doplnění vlastníků u firem bez dohledaných společníků/akcionářů")
-    st.caption("Vyber firmu bez vlastníků (OR) a doplň její vlastníky (IČO + podíl). Po přidání se struktura rekurzivně rozbalí až k FO.")
+    st.caption("Vyber firmu bez vlastníků (dle OR) a doplň její vlastníky (IČO + podíl). Po přidání se struktura rozbalí až k dalším dohledaným FO.")
 
     unresolved_list = lr.get("unresolved") or []
     if not unresolved_list:
-        st.info("V aktuální struktuře nejsou firmy bez dohledaných vlastníků.")
+        st.info("V aktuální struktuře jsou všechny vlastnické vztahy dohledány.")
     else:
         opts = [f"{u.get('name','?')} (IČO {str(u.get('ico') or '').zfill(8)})" for u in unresolved_list]
         picked = st.selectbox("Firma k doplnění", options=opts, index=0)
@@ -1113,10 +1113,10 @@ if lr:
             st.markdown("---")
 
     # Manuální osoby
-    st.markdown("**Manuální doplnění osob (např. u akciové společnosti):**")
+    st.markdown("**Manuální doplnění osob (např. u náhradního skutečného majitele):**")
     colM1, colM2, colM3, colM4, colM5, colM6, colM7 = st.columns([3, 2, 2, 2, 2, 2, 2])
     with colM1:
-        manual_name = st.text_input("Jméno osoby (manuálně)", value="", key="manual_name")
+        manual_name = st.text_input("Jméno osoby", value="", key="manual_name")
     with colM2:
         manual_cap = st.number_input("Podíl na kapitálu (%)", min_value=0.0, max_value=100.0, value=0.0, step=0.01, key="manual_cap")
     with colM3:
@@ -1176,8 +1176,8 @@ if lr:
             colA, colB, colC, colD, colE = st.columns([2.8, 2.0, 2.0, 2.0, 2.2])
             with colA:
                 st.markdown(f"- **{name}**")
-                st.markdown(f"  • Kapitál: **{fmt_pct(info['ownership'])}**")
-                st.markdown(f"  • Hlasovací: **{fmt_pct(info['voting'])}**")
+                st.markdown(f"  • Podíl na ZK: **{fmt_pct(info['ownership'])}**")
+                st.markdown(f"  • Podíl na HP: **{fmt_pct(info['voting'])}**")
             with colB:
                 cap_default = overrides_cap.get(name, info["ownership"]) * 100.0
                 edited_cap_pct[name] = st.number_input(
@@ -1213,7 +1213,9 @@ if lr:
             "Vyber účastníky voting blocku",
             all_names,
             st.session_state.get("block_members_last", []),
+            placeholder="např. Jan Novák",
         )
+
         block_name = st.text_input("Název voting blocku", value=st.session_state.get("block_name_last", "Voting Block 1"))
 
         submitted = st.form_submit_button("Vyhodnotit skutečné majitele")
