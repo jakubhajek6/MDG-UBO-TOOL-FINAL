@@ -975,16 +975,14 @@ def _norm_ico(s: str) -> str:
 
 def _parse_pairs_mixed(s: str):
     """
-    Vstup (odděleno čárkou):
-      - CZ firma:        03999840: 50
-      - Zahraničí (Z-ID): Z4159842: 50
-      - Zahraničí + název: Z4159842 - ATREA Family Invest s.r.o.: 50
-      - Fyzická osoba:   Ing. Jan Novák: 20
+    Parse manual owners in formats:
+      - 03999840: 50               -> CZ company (IČO)
+      - 03999840 - Firma s.r.o.: 50 -> CZ company with name
+      - Z4159842: 50               -> foreign entity (ID)
+      - Z4159842 - ATREA Family SK s.r.o.: 50 -> foreign entity with name
+      - Ing. Jan Novák: 20         -> person
 
-    Výstup: list dictů:
-      {"type":"CZ", "id":"12345678", "name":None|str, "share":0..1}
-      {"type":"FOREIGN", "id":"Z4159842", "name":"ATREA Family Invest s.r.o."|None, "share":0..1}
-      {"type":"PERSON", "id":None, "name":"Ing. Jan Novák", "share":0..1}
+    Returns list of dicts: {"type": "...", "id"/"ico"/"name": ..., "share": 0..1, "name": optional}
     """
     out = []
     for chunk in (s or "").split(","):
@@ -993,7 +991,7 @@ def _parse_pairs_mixed(s: str):
             continue
 
         if ":" not in chunk:
-            st.error(f"Nesprávný formát: „{chunk}“ — očekáván „ID/Jméno: %“")
+            st.error(f"Nesprávný formát: „{chunk}“ — očekáván „ID/IČO/jméno: %“")
             return None
 
         left, pct_part = chunk.split(":", 1)
@@ -1001,63 +999,51 @@ def _parse_pairs_mixed(s: str):
         pct_part = pct_part.strip()
 
         try:
-            pct = float(pct_part.replace(",", ".").replace(";", ".").strip())
+            pct = float(pct_part.replace(",", ".").replace(";", "."))
         except Exception:
             st.error(f"Neplatné procento: „{pct_part}“")
             return None
         if pct <= 0:
             st.error(f"Podíl musí být > 0: „{pct}“")
             return None
-        share01 = pct / 100.0
+        share = pct / 100.0
 
-        # Podpora "ID - Název" nebo "ID — Název"
-        owner_id = left
-        owner_name = None
-        if " - " in left:
-            p1, p2 = left.split(" - ", 1)
-            owner_id = p1.strip()
-            owner_name = (p2.strip() or None)
-        elif " — " in left:
-            p1, p2 = left.split(" — ", 1)
-            owner_id = p1.strip()
-            owner_name = (p2.strip() or None)
+        # allow "ID - Name" or "IČO - Name"
+        name_opt = None
+        id_part = left
+        m = re.split(r"\s+[—–-]\s+", left, maxsplit=1)
+        if len(m) == 2:
+            id_part = m[0].strip()
+            name_opt = m[1].strip() or None
 
-        # 1) zahraniční subjekt: Z + čísla
-        if re.fullmatch(r"[Zz]\d+", owner_id or ""):
-            out.append({
-                "type": "FOREIGN",
-                "id": owner_id.upper(),
-                "name": owner_name,
-                "share": share01,
-            })
-            continue
+        # normalize / decide type
+        digits = re.sub(r"\D+", "", id_part)
 
-        # 2) CZ IČO (7–8 číslic)
-        digits = re.sub(r"\D", "", owner_id or "")
-        if digits.isdigit() and len(digits) in (7, 8):
+        # 1) CZ company by IČO (7/8 digits)
+        if digits.isdigit() and len(digits) in (7, 8) and id_part.strip().isdigit():
             ico_clean = digits.zfill(8)
-            out.append({
-                "type": "CZ",
-                "id": ico_clean,
-                "name": owner_name,  # může být None
-                "share": share01,
-            })
+            out.append({"type": "CZ", "id": ico_clean, "name": name_opt, "share": share})
             continue
 
-        # 3) jinak fyzická osoba (jméno)
-        person_name = left.strip()
-        if not person_name:
-            st.error(f"Nesprávný formát: „{chunk}“ — chybí jméno/ID")
-            return None
+        # 2) Foreign id like Z4159842 / SK123456 / DE12345...
+        fid = id_part.strip()
+        if FOREIGN_ID_RE.match(fid):
+            out.append({"type": "FOREIGN", "id": fid.upper(), "name": name_opt, "share": share})
+            continue
 
-        out.append({
-            "type": "PERSON",
-            "id": None,
-            "name": person_name,
-            "share": share01,
-        })
+        # 3) Otherwise treat as person name
+        person_name = left.strip()  # keep full left incl. titles
+        # but if "id - name" form used, use the name part as person name (more intuitive)
+        if name_opt and not FOREIGN_ID_RE.match(id_part) and not (digits.isdigit() and len(digits) in (7, 8)):
+            person_name = name_opt
+
+        if not person_name:
+            st.error(f"Neplatné jméno: „{left}“")
+            return None
+        out.append({"type": "PERSON", "name": person_name, "share": share})
 
     return out
+
 
 
 # ===== Resolve logic =====
