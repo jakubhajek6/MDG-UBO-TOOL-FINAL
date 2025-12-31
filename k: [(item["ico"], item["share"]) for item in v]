@@ -975,47 +975,90 @@ def _norm_ico(s: str) -> str:
 
 def _parse_pairs_mixed(s: str):
     """
-    Formát:
-      - IČO: %   (CZ firma)
-      - Z4159842: % (zahraniční subjekt, ID)
-      - Jméno osoby: % (FO)
+    Vstup (odděleno čárkou):
+      - CZ firma:        03999840: 50
+      - Zahraničí (Z-ID): Z4159842: 50
+      - Zahraničí + název: Z4159842 - ATREA Family Invest s.r.o.: 50
+      - Fyzická osoba:   Ing. Jan Novák: 20
+
+    Výstup: list dictů:
+      {"type":"CZ", "id":"12345678", "name":None|str, "share":0..1}
+      {"type":"FOREIGN", "id":"Z4159842", "name":"ATREA Family Invest s.r.o."|None, "share":0..1}
+      {"type":"PERSON", "id":None, "name":"Ing. Jan Novák", "share":0..1}
     """
     out = []
     for chunk in (s or "").split(","):
         chunk = chunk.strip()
         if not chunk:
             continue
+
         if ":" not in chunk:
-            st.error(f"Nesprávný formát: „{chunk}“ — očekáván „IČO: %“, „Z4159842: %“ nebo „Jméno: %“")
+            st.error(f"Nesprávný formát: „{chunk}“ — očekáván „ID/Jméno: %“")
             return None
+
         left, pct_part = chunk.split(":", 1)
         left = left.strip()
+        pct_part = pct_part.strip()
 
         try:
-            pct = float(pct_part.replace(",", ".").strip())
+            pct = float(pct_part.replace(",", ".").replace(";", ".").strip())
         except Exception:
             st.error(f"Neplatné procento: „{pct_part}“")
             return None
         if pct <= 0:
             st.error(f"Podíl musí být > 0: „{pct}“")
             return None
+        share01 = pct / 100.0
 
-        # CZ company
-        left_digits = re.sub(r"\D", "", left)
-        if ICO_ONLY_RE.match(left_digits):
-            ico_norm = _norm_ico(left_digits)
-            out.append({"type": "company", "ico": ico_norm, "share": pct / 100.0})
+        # Podpora "ID - Název" nebo "ID — Název"
+        owner_id = left
+        owner_name = None
+        if " - " in left:
+            p1, p2 = left.split(" - ", 1)
+            owner_id = p1.strip()
+            owner_name = (p2.strip() or None)
+        elif " — " in left:
+            p1, p2 = left.split(" — ", 1)
+            owner_id = p1.strip()
+            owner_name = (p2.strip() or None)
+
+        # 1) zahraniční subjekt: Z + čísla
+        if re.fullmatch(r"[Zz]\d+", owner_id or ""):
+            out.append({
+                "type": "FOREIGN",
+                "id": owner_id.upper(),
+                "name": owner_name,
+                "share": share01,
+            })
             continue
 
-        # foreign
-        if FOREIGN_ID_RE.match(left) and not ICO_ONLY_RE.match(left):
-            out.append({"type": "foreign", "id": left, "share": pct / 100.0})
+        # 2) CZ IČO (7–8 číslic)
+        digits = re.sub(r"\D", "", owner_id or "")
+        if digits.isdigit() and len(digits) in (7, 8):
+            ico_clean = digits.zfill(8)
+            out.append({
+                "type": "CZ",
+                "id": ico_clean,
+                "name": owner_name,  # může být None
+                "share": share01,
+            })
             continue
 
-        # person
-        out.append({"type": "person", "name": left, "share": pct / 100.0})
+        # 3) jinak fyzická osoba (jméno)
+        person_name = left.strip()
+        if not person_name:
+            st.error(f"Nesprávný formát: „{chunk}“ — chybí jméno/ID")
+            return None
+
+        out.append({
+            "type": "PERSON",
+            "id": None,
+            "name": person_name,
+            "share": share01,
+        })
 
     return out
+
 
 # ===== Resolve logic =====
 def do_resolve():
