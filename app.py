@@ -20,6 +20,7 @@ from importer.graphviz_render import build_graphviz_from_nodelines_bfs
 import base64
 from zoneinfo import ZoneInfo
 
+
 # ===== PATH pro 'dot' (Graphviz) – doplnění běžných cest =====
 for p in ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/opt/local/bin", "/snap/bin"):
     if p not in os.environ.get("PATH", ""):
@@ -75,7 +76,6 @@ logo_bytes, logo_mime = load_project_logo()
 
 # ===== PDF FONT s diakritikou =====
 def find_font_file() -> Path | None:
-    # bere i font v rootu projektu (tvůj případ)
     candidates = [
         Path("DejaVuSans.ttf"),
         Path("assets") / "DejaVuSans.ttf",
@@ -150,7 +150,10 @@ def render_lines(lines):
     return out
 
 RE_COMPANY_HEADER = re.compile(r"^(?P<name>.+)\s+\(IČO\s+(?P<ico>\d{7,8})\)\s*$")
+RE_FOREIGN_HEADER = re.compile(r"^(?P<name>.+)\s+\(ID\s+(?P<fid>[A-Za-z0-9-]+)\)\s*$")
+
 ICO_IN_LINE = re.compile(r"\(IČO\s+(?P<ico>\d{7,8})\)")
+FOREIGN_IN_LINE = re.compile(r"\(ID\s+(?P<fid>[A-Za-z0-9-]+)\)")
 DASH_SPLIT = re.compile(r"\s+[—–-]\s+")
 
 def extract_companies_from_lines(lines) -> list[tuple[str, str]]:
@@ -302,11 +305,16 @@ def parse_pct_from_text(s: str) -> float | None:
 
     return None
 
+def fmt_pct(x: float | None) -> str:
+    if x is None:
+        return "—"
+    return f"{(x * 100.0):.2f}%"
+
 # ===== Výpočet efektivních podílů + diagnostika =====
 def compute_effective_persons(lines) -> dict[str, dict]:
     persons: dict[str, dict] = {}
 
-    header_stack: list[tuple[int, float]] = []   # [(header_depth, multiplier)]
+    header_stack: list[tuple[int, float, str]] = []   # [(header_depth, multiplier, id_kind)]
     pending_next_header_mult: float | None = None
 
     for ln in _ensure_list(lines):
@@ -314,13 +322,24 @@ def compute_effective_persons(lines) -> dict[str, dict]:
         if not t:
             continue
 
+        # header: CZ company
         if RE_COMPANY_HEADER.match(t):
             while header_stack and header_stack[-1][0] >= depth:
                 header_stack.pop()
             parent_mult = header_stack[-1][1] if header_stack else 1.0
             this_mult = pending_next_header_mult if pending_next_header_mult is not None else parent_mult
             pending_next_header_mult = None
-            header_stack.append((depth, this_mult))
+            header_stack.append((depth, this_mult, "company"))
+            continue
+
+        # header: foreign entity
+        if RE_FOREIGN_HEADER.match(t):
+            while header_stack and header_stack[-1][0] >= depth:
+                header_stack.pop()
+            parent_mult = header_stack[-1][1] if header_stack else 1.0
+            this_mult = pending_next_header_mult if pending_next_header_mult is not None else parent_mult
+            pending_next_header_mult = None
+            header_stack.append((depth, this_mult, "foreign"))
             continue
 
         if t.endswith(":"):
@@ -328,7 +347,9 @@ def compute_effective_persons(lines) -> dict[str, dict]:
 
         parts = DASH_SPLIT.split(t, maxsplit=1)
         name = (parts[0] if parts else t).strip()
+
         is_company = ICO_IN_LINE.search(t) is not None
+        is_foreign = FOREIGN_IN_LINE.search(t) is not None
 
         expected_parent_header_depth = max(0, depth - 2)
         while header_stack and header_stack[-1][0] > expected_parent_header_depth:
@@ -343,7 +364,8 @@ def compute_effective_persons(lines) -> dict[str, dict]:
             except Exception:
                 node_eff = None
 
-        if is_company:
+        # ENTITY node (company or foreign): update multiplier for next header
+        if is_company or is_foreign:
             local_share = None
             if node_eff is not None and parent_mult > 0:
                 local_share = node_eff / parent_mult
@@ -356,48 +378,38 @@ def compute_effective_persons(lines) -> dict[str, dict]:
                         if eff_pct is not None and parent_mult > 0:
                             local_share = (eff_pct / 100.0) / parent_mult
             pending_next_header_mult = parent_mult * local_share if local_share is not None else None
+            continue
 
+        # person leaf
+        entry = persons.setdefault(name, {"ownership": 0.0, "voting": 0.0, "debug_paths": []})
+
+        local_share = None
+        eff = None
+        src = None
+        if node_eff is not None:
+            eff = node_eff; src = "node_eff(person)"
         else:
-            entry = persons.setdefault(name, {"ownership": 0.0, "voting": 0.0, "debug_paths": []})
+            local_share = parse_pct_from_text(t)
+            if local_share is not None:
+                eff = parent_mult * local_share; src = "text(person)"
 
-            local_share = None
-            eff = None
-            src = None
-            if node_eff is not None:
-                eff = node_eff; src = "node_eff(person)"
-            else:
-                local_share = parse_pct_from_text(t)
-                if local_share is not None:
-                    eff = parent_mult * local_share; src = "text(person)"
-                else:
-                    m = EFEKTIVNE_RE.search(t)
-                    if m:
-                        eff_pct = _to_float(m.group(1))
-                        if eff_pct is not None:
-                            eff = eff_pct / 100.0; src = "efektivně_text(person)"
+        if eff is not None:
+            entry["ownership"] += eff
+            entry["voting"] += eff
 
-            if eff is not None:
-                entry["ownership"] += eff
-                entry["voting"] += eff
-
-            entry["debug_paths"].append({
-                "parent_depth": parent_depth,
-                "parent_mult": parent_mult,
-                "local_share": local_share,
-                "eff": eff,
-                "source": src or "unknown",
-                "text": t,
-            })
+        entry["debug_paths"].append({
+            "parent_depth": parent_depth,
+            "parent_mult": parent_mult,
+            "local_share": local_share,
+            "eff": eff,
+            "source": src or "unknown",
+            "text": t,
+        })
 
     for v in persons.values():
         v["ownership"] = max(0.0, min(1.0, v["ownership"]))
         v["voting"]    = max(0.0, min(1.0, v["voting"]))
     return persons
-
-def fmt_pct(x: float | None) -> str:
-    if x is None:
-        return "—"
-    return f"{(x * 100.0):.2f}%"
 
 # ===== PDF utils =====
 def _draw_wrapped_string(c: canvas.Canvas, font_name: str, font_size: int, x: float, y: float, text: str, max_width: float):
@@ -464,7 +476,6 @@ def build_pdf(
     c.setFont(PDF_FONT_NAME, 10)
     tz = ZoneInfo("Europe/Prague")
     c.drawString(MARGIN, 18, f"Časové razítko: {datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S')}")
-
 
     start_y = logo_bottom_y - 12
     c.setFont(PDF_FONT_NAME, 12)
@@ -545,7 +556,6 @@ def build_pdf(
         leading = 14
 
         def draw_wrapped_line(text: str, x: float, y: float) -> float:
-            """Nakreslí text zalomený podle max_w, vrátí nové y."""
             words = (text or "").split()
             if not words:
                 c.drawString(x, y, "")
@@ -569,19 +579,17 @@ def build_pdf(
             return y - leading
 
         for line in ubo_lines:
-            # když je to fakt dlouhé, zalomí se podle šířky stránky
             y = draw_wrapped_line(line, MARGIN, y)
             if y < MARGIN + 40:
                 c.showPage()
                 c.setFont(PDF_FONT_NAME, 10)
                 y = PAGE_H - MARGIN - 40
 
-
     c.save()
     return buf.getvalue()
 
 # ===== Export/Import (XML) =====
-EXPORT_SCHEMA_VERSION = "2"
+EXPORT_SCHEMA_VERSION = "3"
 
 def _safe_text(x) -> str:
     return "" if x is None else str(x)
@@ -597,15 +605,23 @@ def export_state_to_xml_bytes() -> bytes:
     add_simple("ico", st.session_state.get("ico_input", ""))
     add_simple("max_depth", st.session_state.get("max_depth", 25))
 
-    # manual_company_owners
+    # manual_company_owners: now typed owners
     mco = ET.SubElement(root, "manual_company_owners")
     manual_company_owners = st.session_state.get("manual_company_owners", {}) or {}
-    for target_ico, owners in manual_company_owners.items():
-        comp = ET.SubElement(mco, "company", attrib={"ico": _safe_text(target_ico)})
+    for target_id, owners in manual_company_owners.items():
+        comp = ET.SubElement(mco, "entity", attrib={"id": _safe_text(target_id)})
         for item in owners or []:
             own = ET.SubElement(comp, "owner")
-            ET.SubElement(own, "ico").text = _safe_text(item.get("ico"))
+            ET.SubElement(own, "type").text = _safe_text(item.get("type"))
             ET.SubElement(own, "share").text = _safe_text(item.get("share"))
+            if item.get("type") == "company":
+                ET.SubElement(own, "ico").text = _safe_text(item.get("ico"))
+                ET.SubElement(own, "name").text = _safe_text(item.get("name"))
+            elif item.get("type") == "foreign":
+                ET.SubElement(own, "id").text = _safe_text(item.get("id"))
+                ET.SubElement(own, "name").text = _safe_text(item.get("name"))
+            elif item.get("type") == "person":
+                ET.SubElement(own, "name").text = _safe_text(item.get("name"))
 
     # manual_persons
     mp = ET.SubElement(root, "manual_persons")
@@ -670,10 +686,51 @@ def import_state_from_xml_bytes(xml_bytes: bytes):
     st.session_state["ico_input"] = ico_val
     st.session_state["max_depth"] = max(1, min(60, int(max_depth_val)))
 
-    # manual_company_owners
-    mco = {}
+    # manual_company_owners (v2 legacy i v3 typed)
+    mco: dict[str, list[dict]] = {}
     mco_root = root.find("manual_company_owners")
     if mco_root is not None:
+        # v3: <entity id="...">
+        for ent in mco_root.findall("entity"):
+            ent_id = (ent.attrib.get("id") or "").strip()
+            owners = []
+            for own in ent.findall("owner"):
+                t = (own.findtext("type") or "").strip().lower()
+                share_txt = own.findtext("share") or "0"
+                try:
+                    share = float(share_txt)
+                except Exception:
+                    share = 0.0
+                if share <= 0:
+                    continue
+
+                if t == "company":
+                    oico = (own.findtext("ico") or "").strip()
+                    oname = (own.findtext("name") or "").strip()
+                    if oico:
+                        owners.append({"type": "company", "ico": re.sub(r"\D", "", oico).zfill(8), "share": share, "name": oname or None})
+                elif t == "foreign":
+                    fid = (own.findtext("id") or "").strip()
+                    oname = (own.findtext("name") or "").strip()
+                    if fid:
+                        owners.append({"type": "foreign", "id": fid, "share": share, "name": oname or None})
+                elif t == "person":
+                    oname = (own.findtext("name") or "").strip()
+                    if oname:
+                        owners.append({"type": "person", "name": oname, "share": share})
+                else:
+                    # fallback: try legacy tags
+                    oico = (own.findtext("ico") or "").strip()
+                    oname = (own.findtext("name") or "").strip()
+                    if oico:
+                        owners.append({"type": "company", "ico": re.sub(r"\D", "", oico).zfill(8), "share": share})
+                    elif oname:
+                        owners.append({"type": "person", "name": oname, "share": share})
+
+            if ent_id:
+                mco[ent_id] = owners
+
+        # v2 legacy: <company ico="..."><owner><ico>...</ico><share>...</share>
         for comp in mco_root.findall("company"):
             tico = (comp.attrib.get("ico") or "").strip()
             owners = []
@@ -685,9 +742,10 @@ def import_state_from_xml_bytes(xml_bytes: bytes):
                 except Exception:
                     share = 0.0
                 if oico:
-                    owners.append({"ico": oico, "share": share})
-            if tico:
+                    owners.append({"type": "company", "ico": re.sub(r"\D", "", oico).zfill(8), "share": share})
+            if tico and tico not in mco:
                 mco[tico] = owners
+
     st.session_state["manual_company_owners"] = mco
 
     # manual_persons
@@ -775,10 +833,7 @@ def import_state_from_xml_bytes(xml_bytes: bytes):
                 if ln.text is not None:
                     imported_ubo_lines.append(ln.text)
 
-    # uložíme snapshot do session, po resolve ho vložíme do last_result
     st.session_state["imported_ubo_pdf_lines"] = imported_ubo_lines
-
-    # trigger auto resolve
     st.session_state["auto_run_resolve"] = True
 
 # ===== Session state defaults =====
@@ -813,7 +868,7 @@ ss_default("import_uploader_key", 0)
 ss_default("import_pending_bytes", None)
 ss_default("imported_ubo_pdf_lines", [])
 
-# ===== Header with popovers – vpravo úplně u okraje a těsně vedle sebe =====
+# ===== Header with popovers =====
 HELP_TEXT = """Pro účely zákona o ESM se skutečným majitelem rozumí každá fyzická osoba, která v konečném důsledku vlastní nebo kontroluje právnickou osobu nebo právní uspořádání.
 
 Korporaci v konečném důsledku vlastní nebo kontroluje každá fyzická osoba, která přímo nebo nepřímo prostřednictvím jiné osoby nebo právního uspořádání:
@@ -826,17 +881,6 @@ Korporaci v konečném důsledku vlastní nebo kontroluje každá fyzická osoba
 Rozhodující vliv v:
 - korporaci uplatňuje ten, kdo na základě vlastního uvážení, bez ohledu na to, zda a na základě jaké právní skutečnosti, může přímo nebo nepřímo prostřednictvím jiné osoby nebo právního uspořádání dosáhnout toho, že rozhodování nejvyššího orgánu korporace odpovídá jeho vůli. Má se za to, že rozhodující vliv v korporaci uplatňuje ten, kdo může jmenovat nebo odvolat většinu osob, které jsou členy statutárního orgánu korporace.
 - obchodní korporaci uplatňuje ovládající osoba podle zákona upravujícího právní poměry obchodních korporací.
-
-Jak na to?
-V § 9 odst. 2 písm. b) AML zákona se požaduje, aby povinná osoba v rámci kontroly klienta provedla zjištění totožnosti SM a přijala opatření k ověření jeho totožnosti z důvěryhodných zdrojů s tím, že v případě, že klient podléhá povinnosti zápisu do ESM nebo obdobného registru, povinná osoba ověřila SM vždy alespoň z této ESM nebo obdobného registru a z jednoho dalšího zdroje.
-
-Základním východiskem povinnosti zjišťování SM v AML zákoně je získání údajů z ESM, či jiné obdobné evidence. Vedle toho je požadováno, aby tento základní zdroj, jejž lze beze sporu považovat za zdroj vysoce důvěryhodný, byl doplněn dalším zdrojem.
-
-Povinná osoba by měla vycházet z kategorizace klientů podle rizikového profilu, kdy u klientů s nízkým či středním rizikem ML/TF se lze spokojit s doplňujícím zdrojem v podobě dokumentovaného čestného prohlášení SM nebo člena statutárního orgánu klienta - právnické osoby. Zatímco v případě vysoce rizikových klientů je nutné informace z ESM doplnit o vlastní šetření povinné osoby.
-
-Jsou-li naplněny zákonné podmínky pro povinné provedení zesílené kontroly, pak z § 9a odst. 3 písm. a) bodu 1 AML zákona vyplývá povinnost získat další informace nebo dokumenty o SM.
-
-Aktualizaci informací o SM lze provést nahlédnutím do ESM, případně také dotazem na klienta. Případný dotaz na klienta musí být zaznamenán a formulován tak, aby klient odpověděl komisivně, čili aby výslovně odsouhlasil aktuálnost údajů v ESM. Pokud klient neposkytne potřebnou součinnost, je na místě uplatnit postup podle § 15 AML zákona.
 """
 
 h_left, h_right = st.columns([8.5, 1.5], vertical_alignment="top")
@@ -856,9 +900,7 @@ with h_left:
         unsafe_allow_html=True
     )
 
-
 with h_right:
-    # na úplný pravý okraj, popovery vedle sebe
     r1, r2 = st.columns([1.2, 0.7], vertical_alignment="top")
     with r1:
         with st.popover("UŽITEČNÉ ODKAZY"):
@@ -874,7 +916,7 @@ with h_right:
 
 st.markdown("<br>", unsafe_allow_html=True)
 
-# ===== UI vstupy + EXPORT/IMPORT na úrovni tlačítka =====
+# ===== UI vstupy + EXPORT/IMPORT =====
 ico = st.text_input("IČO společnosti", value=st.session_state.get("ico_input", ""), placeholder="např. 03999840")
 st.session_state["ico_input"] = ico
 
@@ -912,7 +954,7 @@ with top3:
                 try:
                     import_state_from_xml_bytes(st.session_state["import_pending_bytes"])
                     st.session_state["import_pending_bytes"] = None
-                    st.session_state["import_uploader_key"] += 1  # reset uploaderu = konec loopu
+                    st.session_state["import_uploader_key"] += 1
                     st.success("Import hotový. Obnovuji stav a znovu načtu strukturu…")
                     st.rerun()
                 except Exception as e:
@@ -920,6 +962,60 @@ with top3:
 
 with top4:
     st.write("")
+
+# ===== Manuální doplnění – parser =====
+ICO_ONLY_RE = re.compile(r"^\d{7,8}$")
+FOREIGN_ID_RE = re.compile(r"^[A-Za-z]{1,6}\d{3,}$")
+
+def _norm_ico(s: str) -> str:
+    digits = re.sub(r"\D", "", s or "")
+    if len(digits) == 7:
+        digits = "0" + digits
+    return digits.zfill(8)
+
+def _parse_pairs_mixed(s: str):
+    """
+    Formát:
+      - IČO: %   (CZ firma)
+      - Z4159842: % (zahraniční subjekt, ID)
+      - Jméno osoby: % (FO)
+    """
+    out = []
+    for chunk in (s or "").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if ":" not in chunk:
+            st.error(f"Nesprávný formát: „{chunk}“ — očekáván „IČO: %“, „Z4159842: %“ nebo „Jméno: %“")
+            return None
+        left, pct_part = chunk.split(":", 1)
+        left = left.strip()
+
+        try:
+            pct = float(pct_part.replace(",", ".").strip())
+        except Exception:
+            st.error(f"Neplatné procento: „{pct_part}“")
+            return None
+        if pct <= 0:
+            st.error(f"Podíl musí být > 0: „{pct}“")
+            return None
+
+        # CZ company
+        left_digits = re.sub(r"\D", "", left)
+        if ICO_ONLY_RE.match(left_digits):
+            ico_norm = _norm_ico(left_digits)
+            out.append({"type": "company", "ico": ico_norm, "share": pct / 100.0})
+            continue
+
+        # foreign
+        if FOREIGN_ID_RE.match(left) and not ICO_ONLY_RE.match(left):
+            out.append({"type": "foreign", "id": left, "share": pct / 100.0})
+            continue
+
+        # person
+        out.append({"type": "person", "name": left, "share": pct / 100.0})
+
+    return out
 
 # ===== Resolve logic =====
 def do_resolve():
@@ -932,10 +1028,9 @@ def do_resolve():
         client = AresVrClient(ares_db_path)
         cb("Načítám z ARES a rozkrývám…", 0.10)
 
-        manual_overrides = {
-            k: [(item["ico"], item["share"]) for item in v]
-            for k, v in (st.session_state.get("manual_company_owners") or {}).items()
-        }
+        # NOTE: now pass typed overrides directly
+        manual_overrides = st.session_state.get("manual_company_owners") or {}
+
         res = resolve_tree_online(
             client=client,
             root_ico=ico.strip(),
@@ -955,7 +1050,7 @@ def do_resolve():
 
         graph_png = None
         try:
-            graph_png = g.pipe(format="png")  # vyžaduje systémový graphviz
+            graph_png = g.pipe(format="png")
         except Exception:
             graph_png = None
 
@@ -972,7 +1067,6 @@ def do_resolve():
             "unresolved": [w for w in warnings if isinstance(w, dict) and w.get("kind") == "unresolved"],
         }
 
-        # po importu: pokud máme snapshot ubo_pdf_lines, přeneseme ho do last_result
         imported_lines = st.session_state.get("imported_ubo_pdf_lines") or []
         if imported_lines:
             st.session_state["last_result"]["ubo_pdf_lines"] = imported_lines
@@ -982,9 +1076,7 @@ def do_resolve():
         st.error("Spadlo to na chybě:")
         st.code(str(e))
 
-# Button / auto-run
 if run:
-    # při ručním runu nemažeme importované volby, jen znovu načteme strukturu
     do_resolve()
 
 if st.session_state.get("auto_run_resolve"):
@@ -996,7 +1088,7 @@ if st.session_state.get("auto_run_resolve"):
 lr = st.session_state.get("last_result")
 if lr:
     st.subheader("VÝSLEDEK (text)")
-    st.caption("Odsazení = úroveň. Každý blok: firma → její společníci/akcionáři.")
+    st.caption("Odsazení = úroveň. Každý blok: entita → její společníci/akcionáři.")
     st.code("\n".join(lr["text_lines"]), language="text")
 
     st.subheader("VÝSLEDEK (graf)")
@@ -1011,65 +1103,55 @@ if lr:
         st.warning("Nelze zobrazit graf (Graphviz).")
 
     # ===== Manuální doplnění vlastníků =====
-    st.subheader("Doplnění vlastníků u firem bez dohledaných společníků/akcionářů")
-    st.caption("Vyber firmu bez vlastníků (dle OR) a doplň její vlastníky (IČO + podíl). Po přidání se struktura rozbalí až k dalším dohledaným FO.")
+    st.subheader("Doplnění vlastníků u entit bez dohledaných vlastníků (CZ i zahraničí)")
+    st.caption(
+        "Vyber entitu bez vlastníků a doplň její vlastníky.\n\n"
+        "Podporované formáty:\n"
+        "- `03999840: 50` (CZ firma, IČO) → dohledává ARES\n"
+        "- `Z4159842: 50` (zahraniční subjekt) → nedohledává, umožní další ruční rozkrytí\n"
+        "- `Ing. Petr Morávek: 20` (fyzická osoba)\n"
+    )
 
     unresolved_list = lr.get("unresolved") or []
     if not unresolved_list:
         st.info("V aktuální struktuře jsou všechny vlastnické vztahy dohledány.")
     else:
-        opts = [f"{u.get('name','?')} (IČO {str(u.get('ico') or '').zfill(8)})" for u in unresolved_list]
-        picked = st.selectbox("Firma k doplnění", options=opts, index=0)
-        picked_idx = opts.index(picked) if picked in opts else 0
-        target_ico = str(unresolved_list[picked_idx].get("ico") or "").zfill(8)
-        target_name = unresolved_list[picked_idx].get("name") or "Neznámá firma"
+        def _fmt_unres(u: dict) -> str:
+            nm = u.get("name", "?")
+            uid = (u.get("id") or u.get("ico") or "").strip()
+            if u.get("ico"):
+                return f"{nm} (IČO {str(u.get('ico')).zfill(8)})"
+            return f"{nm} (ID {uid})"
 
-        st.markdown("**Zadej vlastníky (IČO a podíl v %)** — formát: `ICO1: 50, ICO2: 50`")
-        owners_raw = st.text_input("Seznam vlastníků (IČO: %, oddělit čárkou)", placeholder="03999840: 50, 17947103: 50")
+        opts = [_fmt_unres(u) for u in unresolved_list]
+        picked = st.selectbox("Entita k doplnění", options=opts, index=0)
+        picked_idx = opts.index(picked) if picked in opts else 0
+        picked_obj = unresolved_list[picked_idx] if unresolved_list else {}
+        target_id = (picked_obj.get("id") or picked_obj.get("ico") or "").strip()
+        target_name = picked_obj.get("name") or "Neznámá entita"
+
+        st.markdown("**Zadej vlastníky (IČO / ID / jméno a podíl v %)** — formát např.:")
+        st.code("03999840: 50, Z4159842: 30, Ing. Jan Novák: 20", language="text")
+        owners_raw = st.text_input("Seznam vlastníků (oddělit čárkou)", placeholder="Z4159842: 50, Ing. Jan Novák: 50")
 
         add_btn = st.button("➕ Přidat do vlastnické struktury (manuálně)")
         if add_btn:
-            def _parse_pairs(s: str):
-                out = []
-                for chunk in (s or "").split(","):
-                    chunk = chunk.strip()
-                    if not chunk:
-                        continue
-                    if ":" not in chunk:
-                        st.error(f"Nesprávný formát: „{chunk}“ — očekáván „IČO: %“")
-                        return None
-                    ico_part, pct_part = chunk.split(":", 1)
-                    ico_clean = re.sub(r"\D", "", ico_part).zfill(8)
-                    if not ico_clean or not ico_clean.isdigit() or len(ico_clean) != 8:
-                        st.error(f"Neplatné IČO: „{ico_part}“")
-                        return None
-                    try:
-                        pct = float(pct_part.replace(",", ".").strip())
-                    except Exception:
-                        st.error(f"Neplatné procento: „{pct_part}“")
-                        return None
-                    if pct <= 0:
-                        st.error(f"Podíl musí být > 0: „{pct}“")
-                        return None
-                    out.append({"ico": ico_clean, "share": pct / 100.0})
-                return out
-
-            parsed = _parse_pairs(owners_raw)
+            parsed = _parse_pairs_mixed(owners_raw)
             if parsed is not None and parsed:
                 total = sum(p["share"] for p in parsed)
                 if total > 1.0 + 1e-6:
                     st.warning(f"Součet podílů {total*100.0:.2f}% > 100% — pokračuji, ale zvaž úpravu.")
 
-                st.session_state["manual_company_owners"][target_ico] = parsed
+                st.session_state["manual_company_owners"][target_id] = parsed
                 do_resolve()
-                st.success(f"Přidáno: {target_name} (IČO {target_ico}) — vlastníci doplněni, struktura znovu rozkryta.")
+                st.success(f"Přidáno: {target_name} ({target_id}) — vlastníci doplněni, struktura znovu rozkryta.")
                 st.rerun()
 
     # ===== OR links + PDF without UBO =====
     st.subheader("ODKAZY NA OBCHODNÍ REJSTŘÍK")
     companies = lr["companies"]
     if not companies:
-        st.info("Nebyla nalezena žádná právnická osoba s IČO.")
+        st.info("Nebyla nalezena žádná česká právnická osoba s IČO.")
     else:
         for name, ico_val in companies:
             url = f"https://or.justice.cz/ias/ui/rejstrik-$firma?ico={ico_val}&jenPlatne=VSECHNY"
@@ -1092,8 +1174,8 @@ if lr:
     )
 
     # ===== SKUTEČNÍ MAJITELÉ =====
-    st.subheader("SKUTEČNÍ MAJITELÉ (dle OR)")
-    st.caption("Automatický přepočet textových podílů, násobení napříč patry. Úpravy ZK/HP v %, právo veta, „jmenuje/odvolává většinu orgánu“, náhradní SM (§ 5 ZESM) a voting block. Práh je striktně > nastavené hodnoty.")
+    st.subheader("SKUTEČNÍ MAJITELÉ (dle struktury)")
+    st.caption("Automatický přepočet podílů, násobení napříč patry. Práh je striktně > nastavené hodnoty.")
 
     persons = compute_effective_persons(lr["lines"])
 
@@ -1112,7 +1194,7 @@ if lr:
                 )
             st.markdown("---")
 
-    # Manuální osoby
+    # Manuální osoby (odděleně – stále užitečné pro náhradní SM apod.)
     st.markdown("**Manuální doplnění osob (např. náhradní SM):**")
     colM1, colM2, colM3, colM4, colM5, colM6, colM7 = st.columns([3, 2, 2, 2, 2, 2, 2])
     with colM1:
@@ -1162,11 +1244,10 @@ if lr:
         threshold_pct = st.number_input(
             "Práh pro skutečného majitele (%)",
             min_value=0.0, max_value=100.0, value=float(st.session_state.get("threshold_pct_last", 25.0)), step=0.01,
-            help="Práh je nastaven striktně na \"více než\" 25 %, tzn. SM se stane osoba (či voting block) s 25,01 % a více."
-
+            help="Práh je nastaven striktně na \"více než\" 25 % (tj. 25,01 % a více)."
         )
 
-        st.write("**Osoby a jejich efektivní podíly (z OR) + možnost úprav:**")
+        st.write("**Osoby a jejich efektivní podíly + možnost úprav:**")
         veto_flags: dict[str, bool] = {}
         org_majority_flags: dict[str, bool] = {}
         substitute_flags: dict[str, bool] = {}
@@ -1317,9 +1398,9 @@ if lr:
                 ubo_report_lines.append(line_txt)
 
         st.session_state["last_result"]["ubo_pdf_lines"] = ubo_report_lines
-        st.session_state["imported_ubo_pdf_lines"] = ubo_report_lines  # aby export/import byl konzistentní
+        st.session_state["imported_ubo_pdf_lines"] = ubo_report_lines
 
-    # ===== POST-CHECK + PDF (po vyhodnocení nebo po importu snapshotu) =====
+    # ===== POST-CHECK + PDF =====
     if lr.get("ubo_pdf_lines"):
         st.divider()
         st.markdown("### Poznámka a kontrolní otázky")
