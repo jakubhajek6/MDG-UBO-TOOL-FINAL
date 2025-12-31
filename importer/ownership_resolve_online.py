@@ -259,39 +259,85 @@ def resolve_tree_online(
         )
 
         # --- manuální doplnění vlastníků pro tuto CZ firmu ---
-        manual_for_this = mo.get(c_ico, [])
-        manual_owners_from_mo: List[Owner] = []
+        manual_for_this = (manual_overrides or {}).get(c_ico, [])
+        manual_owners: List[Owner] = []
 
-        for it in manual_for_this:
-            t = (it.get("type") or "").lower().strip()
-            share = float(it.get("share") or 0.0)
-            if share <= 0:
+        for item in (manual_for_this or []):
+            # zpětná kompatibilita: když někde zůstaly tuple (ico, share)
+            if isinstance(item, (tuple, list)) and len(item) >= 2:
+                item = {"type": "CZ", "id": str(item[0]), "name": None, "share": float(item[1])}
+
+            itype = (item.get("type") or "CZ").upper()
+            oid = item.get("id")
+            oname = (item.get("name") or "").strip() or None
+            oshare = float(item.get("share") or 0.0)
+
+            if oshare <= 0:
                 continue
 
-            if t == "company":
-                owner_ico = _norm_ico(str(it.get("ico") or ""))
-                if not owner_ico:
+            # 1) FO – nikdy se nedohledává ARES, je to konec větve
+            if itype == "PERSON":
+                pname = (item.get("name") or "").strip()
+                if not pname:
                     continue
-                o_name_final = it.get("name") or f"Společnost (IČO {owner_ico})"
-                # zkus dohledat název přes ARES (best-effort)
-                try:
-                    p2 = client.get_vr(owner_ico)
-                    _ico2, _name2, _ = extract_current_owners(p2)
-                    if _name2:
-                        o_name_final = _name2
-                except Exception:
-                    pass
-
-                manual_owners_from_mo.append(
+                manual_owners.append(
                     Owner(
-                        kind="COMPANY",
-                        name=o_name_final,
-                        ico=owner_ico,
-                        share_pct=share * 100.0,
-                        share_raw=f"velikost:{share*100.0:.2f} PROCENTA",
+                        kind="PERSON",
+                        name=pname,
+                        ico=None,
+                        share_pct=oshare * 100.0,
+                        share_raw=f"{oshare*100.0:.2f} %",
                         label="Manuálně doplněno",
                     )
                 )
+                continue
+
+            # 2) FOREIGN – Zxxxx… nikdy nevolej ARES a nikdy nerekurzuj automaticky
+            if itype == "FOREIGN":
+                zid = str(oid or "").strip().upper()
+                if not zid:
+                    continue
+                display = oname or f"Zahraniční subjekt ({zid})"
+                manual_owners.append(
+                    Owner(
+                        kind="FOREIGN",
+                        name=display,
+                        ico=zid,  # držíme Z-ID v poli ico (jen jako identifikátor)
+                        share_pct=oshare * 100.0,
+                        share_raw=f"{oshare*100.0:.2f} %",
+                        label="Manuálně doplněno",
+                    )
+                )
+                continue
+
+            # 3) CZ firma – můžeš zkusit dohledat název přes ARES (pokud není vyplněn)
+            ico_raw = str(oid or "").strip()
+            ico_clean = re.sub(r"\D+", "", ico_raw).zfill(8)
+            if not ico_clean.isdigit() or len(ico_clean) != 8:
+                continue
+
+            o_name_final = oname or f"Společnost (IČO {ico_clean})"
+            if oname is None:
+                try:
+                    p2 = client.get_vr(ico_clean)
+                    if not p2.get("_error"):
+                        _ico2, _name2, _ = extract_current_owners(p2)
+                        if _name2:
+                            o_name_final = _name2
+                except Exception:
+                    pass
+
+            manual_owners.append(
+                Owner(
+                    kind="COMPANY",
+                    name=o_name_final,
+                    ico=ico_clean,
+                    share_pct=oshare * 100.0,
+                    share_raw=f"velikost:{oshare*100.0:.2f} PROCENTA",
+                    label="Manuálně doplněno",
+                )
+            )
+
 
             elif t == "foreign":
                 fid = str(it.get("id") or "").strip()
