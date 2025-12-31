@@ -1130,9 +1130,7 @@ if lr:
         target_id = (picked_obj.get("id") or picked_obj.get("ico") or "").strip()
         target_name = picked_obj.get("name") or "Neznámá entita"
 
-        st.markdown("**Zadej vlastníky (IČO / ID / jméno a podíl v %)** — formát např.:")
-        st.code("03999840: 50, Z4159842: 30, Ing. Jan Novák: 20", language="text")
-        owners_raw = st.text_input("Seznam vlastníků (oddělit čárkou)", placeholder="Z4159842: 50, Ing. Jan Novák: 50")
+        owners_raw = st.text_input("Seznam vlastníků (oddělit čárkou)", placeholder="03999840: 50, Z4159842: 30, Ing. Jan Novák: 20")
 
         add_btn = st.button("➕ Přidat do vlastnické struktury (manuálně)")
         if add_btn:
