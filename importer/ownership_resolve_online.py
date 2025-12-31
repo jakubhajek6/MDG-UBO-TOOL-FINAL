@@ -531,16 +531,40 @@ def resolve_tree_online(
 
                 else:
                     # Fyzická osoba
+
+                    # pokus o robustní získání lokálního podílu (0..1)
+                    if local_share is None:
+                        sr = (getattr(o, "share_raw", "") or "").strip()
+
+                        # 1) standardní parser (umí % / PROCENTA / zlomky…)
+                        local_share = parse_pct_from_text(sr)
+
+                        # 2) fallback: čisté číslo bez % ber jako procenta (např. "100" nebo "50.0")
+                        if local_share is None and sr:
+                            try:
+                                v = float(sr.replace(",", ".").replace(";", "."))
+                                # interpretace jako procenta
+                                local_share = max(0.0, min(1.0, v / 100.0))
+                            except Exception:
+                                pass
+
+                    # pokud umíme lokální podíl -> dopočti efektivní a vypiš vždy
                     if local_share is not None:
-                        eff_pct2 = parent_multiplier * local_share * 100.0
+                        eff_pct = parent_multiplier * local_share * 100.0
+                        base_pct = local_share * 100.0
+
+                        # pokud je to "root" (parent_multiplier ~ 1), můžeš chtít jen 100% bez "efektivně"
+                        # ale ty chceš mít efektivně vždy, takže to vypíšeme vždy:
                         lines.append(
                             NodeLine(
                                 depth + 2,
                                 label,
-                                f"{o.name} — {local_share * 100.0:.2f}%",
-                                eff_pct2,
+                                f"{o.name} — {base_pct:.2f}% (efektivně {eff_pct:.2f}%)",
+                                eff_pct,
                             )
                         )
+
+                    # pokud nemáme lokální podíl, ale máme "efektivně X%" v textu
                     elif eff_share is not None:
                         if getattr(o, "share_pct", None) is not None:
                             base_txt = f"{float(o.share_pct):.2f}%"
@@ -550,13 +574,16 @@ def resolve_tree_online(
                             NodeLine(
                                 depth + 2,
                                 label,
-                                f"{o.name} — {base_txt}",
+                                f"{o.name} — {base_txt} (efektivně {eff_share * 100.0:.2f}%)",
                                 eff_share * 100.0,
                             )
                         )
+
+                    # úplný fallback – vypiš raw
                     else:
                         raw = f" — {getattr(o, 'share_raw', '')}" if getattr(o, "share_raw", None) else ""
                         lines.append(NodeLine(depth + 2, label, f"{o.name}{raw}", None))
+
 
     # start
     walk_cz_company(root_ico, depth=0, parent_multiplier=1.0)
