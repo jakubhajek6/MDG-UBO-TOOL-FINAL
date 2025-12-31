@@ -917,7 +917,7 @@ with h_right:
 st.markdown("<br>", unsafe_allow_html=True)
 
 # ===== UI vstupy + EXPORT/IMPORT =====
-ico = st.text_input("IČO společnosti", value=st.session_state.get("ico_input", ""), placeholder="např. 03999840")
+ico = st.text_input("IČO společnosti", value=st.session_state.get("ico_input", ""), placeholder="např. 12345678")
 st.session_state["ico_input"] = ico
 
 max_depth = st.slider("Max. hloubka rozkrytí", 1, 60, int(st.session_state.get("max_depth", 25)), 1)
