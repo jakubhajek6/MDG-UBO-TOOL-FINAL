@@ -1109,7 +1109,7 @@ if lr:
         "Podporované formáty:\n"
         "- `03999840: 50` (CZ firma, IČO) → dohledává ARES\n"
         "- `Z4159842: 50` (zahraniční subjekt) → nedohledává, umožní další ruční rozkrytí\n"
-        "- `Ing. Petr Morávek: 20` (fyzická osoba)\n"
+        "- `Ing. Jan Novák: 20` (fyzická osoba)\n"
     )
 
     unresolved_list = lr.get("unresolved") or []
