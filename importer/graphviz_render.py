@@ -1,4 +1,4 @@
-
+# importer/graphviz_render.py
 from __future__ import annotations
 
 import re
@@ -12,8 +12,14 @@ from graphviz import Digraph
 # Firma header: "Název (IČO 12345678)"
 RE_COMPANY_HEADER = re.compile(r"^(?P<name>.+)\s+\(IČO\s+(?P<ico>\d{8})\)\s*$")
 
+# Foreign header: "Název (ID Z45156824)"
+RE_FOREIGN_HEADER = re.compile(r"^(?P<name>.+)\s+\(ID\s+(?P<fid>[A-Za-z0-9]+)\)\s*$")
+
 # Robustní detekce IČO uvnitř řádku (firma vlastník)
 ICO_IN_LINE = re.compile(r"\(IČO\s+(?P<ico>\d{7,8})\)")
+
+# Robustní detekce ID uvnitř řádku (foreign vlastník)
+ID_IN_LINE = re.compile(r"\(ID\s+(?P<fid>[A-Za-z0-9]+)\)")
 
 # Rozdělení jméno/podíl podle jakékoliv pomlčky s mezerami kolem
 DASH_SPLIT = re.compile(r"\s+[—–-]\s+")
@@ -48,7 +54,11 @@ def _norm_ico(ico: str) -> str:
     digits = re.sub(r"\D+", "", ico or "")
     if len(digits) == 7:
         digits = "0" + digits
-    return digits
+    return digits.zfill(8)
+
+
+def _norm_fid(fid: str) -> str:
+    return (fid or "").strip().upper()
 
 
 def _node_id(prefix: str, text: str) -> str:
@@ -65,15 +75,14 @@ def build_graphviz_from_nodelines_bfs(
     Patrové zobrazení (BFS):
     1) root firma
     2) její vlastníci
-    3) vlastníci vlastníků (u firem)
+    3) vlastníci vlastníků (u firem/foreign)
     atd.
 
-    Vylepšení:
-    - uzel končí v nejhlubším patře, kde se objevil
-    - doplnění chybějící hrany parent->firma při headeru (bez duplicit)
-    - prevence self-loop
-    - labely na hranách (doprostřed) – procenta nebo textové podíly
-    - hrany se vykreslí až po zpracování všech řádků (label se vždy doplní)
+    Opravy:
+    - zahraniční uzly (ID) jsou plnohodnotné uzly ve stacku => FO se napojí správně na foreign
+    - foreign owner řádek + foreign header řádek se sloučí do 1 uzlu (ID-based node_id)
+    - foreign uzly jsou boxy + jiná barva
+    - deduplikace hran a doplňování labelů zachováno
     """
 
     root_ico = _norm_ico(root_ico)
@@ -87,13 +96,14 @@ def build_graphviz_from_nodelines_bfs(
     g.attr(fontname="Helvetica")
 
     # ---------- Global styling ----------
-    g.attr('edge', dir='back', color='gray40', fontname='Helvetica', fontsize='10', fontcolor='black')
-    g.attr('node', fontcolor='white', fontname='Helvetica', fontsize='10', margin='0.05,0.04')
-    g.attr(ranksep='0.7', nodesep='0.35')
+    g.attr("edge", dir="back", color="gray40", fontname="Helvetica", fontsize="10", fontcolor="black")
+    g.attr("node", fontcolor="white", fontname="Helvetica", fontsize="10", margin="0.05,0.04")
+    g.attr(ranksep="0.7", nodesep="0.35")
 
     # Barvy
-    COMPANY_FILL = "#2EA39C"  # RGB(46,163,156)
-    PERSON_FILL = "#000000"   # black
+    COMPANY_FILL = "#2EA39C"   # RGB(46,163,156)
+    FOREIGN_FILL = "#E67E22"   # kontrastní k #2EA39C
+    PERSON_FILL = "#000000"    # black
 
     # Osoby: vodorovné elipsy s levým zarovnáním a zalomením
     PERSON_WIDTH = 2.0         # pevná šířka (palce)
@@ -101,8 +111,10 @@ def build_graphviz_from_nodelines_bfs(
     LINE_HEIGHT_IN = 0.18      # výška řádku (~10pt)
     WRAP_MAX_CHARS = 22        # cca znaků na řádek
 
-    # stack aktuální firmy podle hloubky (depth -> (ico, name, level))
-    company_stack: Dict[int, Tuple[str, str, int]] = {}
+    # stack aktuální entity podle hloubky:
+    # depth -> (etype, eid, name, level)
+    # etype: "CZ" | "FOREIGN"
+    entity_stack: Dict[int, Tuple[str, str, str, int]] = {}
 
     # rank buckets: level -> [node_id...]
     ranks: Dict[int, List[str]] = {}
@@ -120,10 +132,10 @@ def build_graphviz_from_nodelines_bfs(
         key = (u, v)
         attrs = edge_attrs.get(key, {})
         if label is not None and label.strip():
-            attrs['label'] = label.strip()
+            attrs["label"] = label.strip()
         edge_attrs[key] = attrs
 
-    def company_level_from_depth(d: int) -> int:
+    def entity_level_from_depth(d: int) -> int:
         if d <= 0:
             return 0
         return d // 3
@@ -146,6 +158,7 @@ def build_graphviz_from_nodelines_bfs(
             ranks[level].append(nid)
 
     def add_company_node(ico: str, name: str, level: int) -> str:
+        ico = _norm_ico(ico)
         nid = f"ICO_{ico}"
         g.node(
             nid,
@@ -154,6 +167,20 @@ def build_graphviz_from_nodelines_bfs(
             style="filled",
             fillcolor=COMPANY_FILL,
             color=COMPANY_FILL,
+        )
+        add_to_rank(level, nid)
+        return nid
+
+    def add_foreign_node(fid: str, name: str, level: int) -> str:
+        fid = _norm_fid(fid)
+        nid = f"FID_{fid}"
+        g.node(
+            nid,
+            f"{name}\n(ID {fid})",
+            shape="box",
+            style="filled",
+            fillcolor=FOREIGN_FILL,
+            color=FOREIGN_FILL,
         )
         add_to_rank(level, nid)
         return nid
@@ -210,7 +237,7 @@ def build_graphviz_from_nodelines_bfs(
             style="filled",
             fillcolor=PERSON_FILL,
             color=PERSON_FILL,
-            fixedsize="true",          # fixní šířka; výška dynamicky
+            fixedsize="true",
             width=str(PERSON_WIDTH),
             height=str(dynamic_height),
             penwidth="1",
@@ -218,44 +245,52 @@ def build_graphviz_from_nodelines_bfs(
         add_to_rank(level, nid)
         return nid
 
-    # ---------- Robustní parsování vlastníka-firmy s podílem ----------
+    # ---------- Parsování owner řádků ----------
     def parse_company_owner_line(t: str) -> Optional[Tuple[str, str, str]]:
-        """
-        Vrátí (owner_name, share_text, owner_ico) z řádku typu:
-          "XYZ s.r.o. — 20.00% (IČO 12345678)"
-        Funguje i pro textové podíly:
-          "ABC, a.s. — vklad:...; obchodni_podil:... (IČO 26014343)"
-        """
         tm = ICO_IN_LINE.search(t)
         if not tm:
             return None
         owner_ico = _norm_ico(tm.group("ico"))
-        left = (t[:tm.start()] or "").strip()  # část před "(IČO ...)"
+        left = (t[:tm.start()] or "").strip()
         parts = DASH_SPLIT.split(left, maxsplit=1)
         if len(parts) == 2:
             owner_name = parts[0].strip()
             share_text = parts[1].strip()
         else:
-            # není pomlčka => není to owner, spíš něco jiného
             return None
         return owner_name, share_text, owner_ico
 
+    def parse_foreign_owner_line(t: str) -> Optional[Tuple[str, str, str]]:
+        tm = ID_IN_LINE.search(t)
+        if not tm:
+            return None
+        fid = _norm_fid(tm.group("fid"))
+        left = (t[:tm.start()] or "").strip()
+        parts = DASH_SPLIT.split(left, maxsplit=1)
+        if len(parts) == 2:
+            owner_name = parts[0].strip()
+            share_text = parts[1].strip()
+        else:
+            return None
+        return owner_name, share_text, fid
+
     def parse_person_owner_line(t: str) -> Optional[Tuple[str, str]]:
-        """
-        Vrátí (person_name, share_text) z řádku osoby, např.:
-          "Ing. JAN ŘEŽÁB — 100.00% (efektivně 20.00%)"
-        """
         parts = DASH_SPLIT.split(t.strip(), maxsplit=1)
         if len(parts) == 2:
             return parts[0].strip(), parts[1].strip()
         return None
 
-    def find_parent_company(depth: int) -> Optional[Tuple[str, str, int]]:
-        candidates = [(d, v) for d, v in company_stack.items() if d < depth]
+    def find_parent_entity(depth: int) -> Optional[Tuple[str, str, str, int]]:
+        candidates = [(d, v) for d, v in entity_stack.items() if d < depth]
         if not candidates:
             return None
         _, v = max(candidates, key=lambda x: x[0])
         return v
+
+    def entity_node_id(etype: str, eid: str) -> str:
+        if etype == "CZ":
+            return f"ICO_{_norm_ico(eid)}"
+        return f"FID_{_norm_fid(eid)}"
 
     # ---------- Parsování vstupu a evidence hran ----------
     for idx, ln in enumerate(items):
@@ -264,62 +299,92 @@ def build_graphviz_from_nodelines_bfs(
         if not t:
             continue
 
-        # Strukturální labely (Společníci/Akcionáři/Manuálně doplněno) ignorujeme jako samostatné uzly v grafu
+        # Strukturální labely ignorujeme jako samostatné uzly v grafu
         if t.endswith(":"):
-            hdr = t[:-1].strip().lower()  # bez ":"; case-insensitive
+            hdr = t[:-1].strip().lower()
             if hdr in ("společníci", "akcionáři", "manuálně doplněno"):
                 continue
 
-        # 1) NEJDŘÍV zkus firma-vlastník (aby header regex "nesebral" owner řádky)
+        # 1) owner řádek CZ firmy
         parsed_company = parse_company_owner_line(t)
         if parsed_company:
             owner_name, share_text, owner_ico = parsed_company
-
-            parent = find_parent_company(depth)
+            parent = find_parent_entity(depth)
             if parent is None:
                 continue
+            p_type, p_id, _, p_level = parent
+            parent_id = entity_node_id(p_type, p_id)
 
-            parent_ico, _, parent_level = parent
-            parent_id = f"ICO_{parent_ico}"
-            owner_id = add_company_node(owner_ico, owner_name, parent_level + 1)
-
-            # Eviduj hranu s labelem (procento nebo text)
+            owner_id = add_company_node(owner_ico, owner_name, p_level + 1)
             record_edge(parent_id, owner_id, label=share_text)
             continue
 
-        # 2) Potom teprve firma header: "Název (IČO ...)"
+        # 2) owner řádek FOREIGN subjektu
+        parsed_foreign = parse_foreign_owner_line(t)
+        if parsed_foreign:
+            owner_name, share_text, fid = parsed_foreign
+            parent = find_parent_entity(depth)
+            if parent is None:
+                continue
+            p_type, p_id, _, p_level = parent
+            parent_id = entity_node_id(p_type, p_id)
+
+            foreign_id = add_foreign_node(fid, owner_name, p_level + 1)
+            record_edge(parent_id, foreign_id, label=share_text)
+            continue
+
+        # 3) header CZ firmy
         m = RE_COMPANY_HEADER.match(t)
         if m:
             ico = _norm_ico(m.group("ico"))
             name = m.group("name").strip()
-            level = company_level_from_depth(depth)
+            level = entity_level_from_depth(depth)
 
             child_id = add_company_node(ico, name, level)
 
-            # Eviduj hranu parent->child (zatím bez labelu); label doplní případný owner řádek
-            parent = find_parent_company(depth)
+            parent = find_parent_entity(depth)
             if parent is not None:
-                parent_ico, _, _parent_level = parent
-                parent_id = f"ICO_{parent_ico}"
+                p_type, p_id, _, _p_level = parent
+                parent_id = entity_node_id(p_type, p_id)
                 record_edge(parent_id, child_id)
 
-            company_stack[depth] = (ico, name, level)
-            # smaž hlubší stack
-            for d in list(company_stack.keys()):
+            entity_stack[depth] = ("CZ", ico, name, level)
+            for d in list(entity_stack.keys()):
                 if d > depth:
-                    del company_stack[d]
+                    del entity_stack[d]
             continue
 
-        # 3) Jinak zkus osoba-vlastník
-        parsed_person = parse_person_owner_line(t)
-        parent = find_parent_company(depth)
+        # 4) header FOREIGN subjektu
+        mf = RE_FOREIGN_HEADER.match(t)
+        if mf:
+            fid = _norm_fid(mf.group("fid"))
+            name = mf.group("name").strip()
+            level = entity_level_from_depth(depth)
+
+            child_id = add_foreign_node(fid, name, level)
+
+            parent = find_parent_entity(depth)
+            if parent is not None:
+                p_type, p_id, _, _p_level = parent
+                parent_id = entity_node_id(p_type, p_id)
+                record_edge(parent_id, child_id)
+
+            entity_stack[depth] = ("FOREIGN", fid, name, level)
+            for d in list(entity_stack.keys()):
+                if d > depth:
+                    del entity_stack[d]
+            continue
+
+        # 5) osoba (vlastník)
+        parent = find_parent_entity(depth)
         if parent is None:
             continue
-        parent_ico, _, parent_level = parent
-        parent_id = f"ICO_{parent_ico}"
+        p_type, p_id, _, p_level = parent
+        parent_id = entity_node_id(p_type, p_id)
 
-        person_id = add_person_node(t, parent_level + 1, unique_key=f"{parent_ico}:{idx}:{t}")
+        person_id = add_person_node(t, p_level + 1, unique_key=f"{p_type}:{p_id}:{idx}:{t}")
 
+        parsed_person = parse_person_owner_line(t)
         if parsed_person:
             _, share_text = parsed_person
             record_edge(parent_id, person_id, label=share_text)
